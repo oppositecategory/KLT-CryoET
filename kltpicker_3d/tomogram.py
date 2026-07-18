@@ -15,6 +15,38 @@ vect_spectrum_estimation = jax.vmap(estimate_isotropic_powerspectrum_tensor,
 vect_radial_average = jax.vmap(radial_average_jax,
                                in_axes=(0,None,None,None))
 
+
+def _extract_nonoverlapping_patches(volume, patch_size):
+    """Use every complete patch independently along all three axes."""
+    blocks = np.asarray(volume.shape, dtype=np.int64) // int(patch_size)
+    if np.any(blocks < 1):
+        raise ValueError(
+            "all tomogram dimensions must be at least as large as patch_size"
+        )
+
+    cropped_shape = blocks * int(patch_size)
+    cropped = volume[
+        :cropped_shape[0],
+        :cropped_shape[1],
+        :cropped_shape[2],
+    ]
+    bz, by, bx = (int(value) for value in blocks)
+    patches = cropped.reshape(
+        bz,
+        patch_size,
+        by,
+        patch_size,
+        bx,
+        patch_size,
+    ).transpose(0, 2, 4, 1, 3, 5)
+    return patches.reshape(
+        bz * by * bx,
+        patch_size,
+        patch_size,
+        patch_size,
+    )
+
+
 class KLTParticleDetector3D:
     """Detect particles in a tomogram using data-adaptive 3D KLT templates.
 
@@ -33,41 +65,78 @@ class KLTParticleDetector3D:
                  threshold: float = 0,
                  max_iter: int = 500, 
                  max_order: int = 10,
-                 template_size_fraction: float = 0.8):
+                 psd_patch_size: int | None = None,
+                 fredholm_radius: float | None = None,
+                 template_side: int | None = None,
+                 bandpass_low_fraction: float = 0.05,
+                 bandpass_high_fraction: float = 0.05,
+                 nms_radius: float | None = None):
         if particle_diameter <= 0:
             raise ValueError("particle_diameter must be positive")
         if mgscale <= 0:
             raise ValueError("mgscale must be positive")
-        if not 0 < template_size_fraction <= 1:
-            raise ValueError("template_size_fraction must be in (0, 1]")
 
         self.tomogram = tomogram 
         self.particle_diameter = float(particle_diameter)
         self.mgscale = float(mgscale)
         self.max_order = max_order
-        self.template_size_fraction = float(template_size_fraction)
         self.bandlimit = np.pi
+        self.bandpass_low_fraction = float(bandpass_low_fraction)
+        self.bandpass_high_fraction = float(bandpass_high_fraction)
 
         scaled_diameter = self.mgscale * self.particle_diameter
         self.particle_diameter_voxels = int(np.floor(scaled_diameter))
+        self.nms_radius_voxels = (
+            0.5 * scaled_diameter
+            if nms_radius is None
+            else float(nms_radius)
+        )
+        if self.nms_radius_voxels < 0:
+            raise ValueError("nms_radius must be nonnegative")
 
         def odd_floor(value):
             size = int(np.floor(value))
             return size if size % 2 else size - 1
 
-        self.patch_size = odd_floor(0.8 * scaled_diameter)
-        self.template_diameter = odd_floor(
-            self.template_size_fraction * scaled_diameter
+        default_patch_size = odd_floor(0.8 * scaled_diameter)
+        self.patch_size = (
+            default_patch_size
+            if psd_patch_size is None
+            else int(psd_patch_size)
         )
-        if self.particle_diameter_voxels < 3 or self.patch_size < 3 or self.template_diameter < 3:
+        self.fredholm_radius_voxels = (
+            0.4 * scaled_diameter
+            if fredholm_radius is None
+            else float(fredholm_radius)
+        )
+        default_template_side = (
+            2 * int(np.ceil(self.fredholm_radius_voxels)) + 1
+        )
+        self.template_side = (
+            default_template_side
+            if template_side is None
+            else int(template_side)
+        )
+        if self.patch_size < 3 or self.patch_size % 2 == 0:
+            raise ValueError("psd_patch_size must be an odd integer at least 3")
+        if self.fredholm_radius_voxels <= 0:
+            raise ValueError("fredholm_radius must be positive")
+        if self.template_side < 3 or self.template_side % 2 == 0:
+            raise ValueError("template_side must be an odd integer at least 3")
+        template_grid_radius = (self.template_side - 1) / 2
+        if template_grid_radius < self.fredholm_radius_voxels:
             raise ValueError(
-                "particle_diameter * mgscale is too small to form a "
-                "three-voxel template"
+                "template_side is too small to contain the Fredholm support"
+            )
+        if self.particle_diameter_voxels < 3:
+            raise ValueError(
+                "particle_diameter * mgscale must span at least three voxels"
             )
 
-        # The radial Fredholm problem is solved on the same spherical support
-        # as the template grid, not in the original physical units.
-        self.template_radius_voxels = (self.template_diameter - 1) / 2
+        # Backward-compatible names for downstream code that treats these as
+        # array dimensions. The Fredholm radius is intentionally independent.
+        self.template_diameter = self.template_side
+        self.template_radius_voxels = self.fredholm_radius_voxels
         self.max_iter = max_iter 
         
         S = 2 * self.patch_size - 1
@@ -83,6 +152,7 @@ class KLTParticleDetector3D:
         self.eigvals = None 
         self.eiguncs = None 
         self.score_mat = None
+        self.preprocessed_tomogram = None
         self.whitened_tomogram = None
         self.initial_particle_psd = None
         self.initial_noise_psd = None
@@ -92,17 +162,25 @@ class KLTParticleDetector3D:
         self.radial_eigvals = None
         self.template_orders = None
         self.template_m_values = None
+        self.templates = None
 
     def process_tomogram(self):
+        self.preprocessed_tomogram = bandpass_filter_3d(
+            self.tomogram,
+            low_fraction=self.bandpass_low_fraction,
+            high_fraction=self.bandpass_high_fraction,
+            normalize=True,
+        )
+
         # First estimate: calibrate the ALS spectra to spatial variances, then
         # use the calibrated noise spectrum to prewhiten the full tomogram.
         initial_particle_psd, initial_noise_psd, _ = self.factorize_RPSD(
-            self.tomogram
+            self.preprocessed_tomogram
         )
         self.initial_particle_psd = initial_particle_psd
         self.initial_noise_psd = initial_noise_psd
         self.whitened_tomogram = prewhiten_tomogram(
-            self.tomogram,
+            self.preprocessed_tomogram,
             self.uniform_points,
             initial_noise_psd,
         )
@@ -117,7 +195,7 @@ class KLTParticleDetector3D:
         self.noise_variance = noise_var_approx
         
         c = self.bandlimit 
-        a = self.template_radius_voxels
+        a = self.fredholm_radius_voxels
         K = self.legendre_order
         X,w = scipy.special.roots_legendre(K)
         X_scaled = c/2*X + c/2
@@ -141,8 +219,13 @@ class KLTParticleDetector3D:
             eigvals.append(lambdas)
             eigfuncs.append(funcs)
 
-        eigfuncs = np.array(eigfuncs).reshape(-1,K)
-        eigvals = np.array(eigvals).reshape(-1)
+        eigfuncs_matrix = np.asarray(eigfuncs)
+        eigvals = np.asarray(eigvals).reshape(-1)
+        # solve_radial_fredholm_equation returns one (K, K) matrix per
+        # angular order with eigenfunctions stored in columns.  Move the
+        # radial-mode axis before flattening so every function remains paired
+        # with its lambda_{ell,n} during the global sort.
+        eigfuncs = eigfuncs_matrix.transpose(0, 2, 1).reshape(-1, K)
 
         orders = np.tile(np.arange(max_order).reshape(-1, 1), (1, K)).reshape(-1)
 
@@ -161,6 +244,7 @@ class KLTParticleDetector3D:
                                                         eigfuncs,
                                                         orders, 
                                                         Gx)
+        self.templates = templates
 
         num_detected,coords = self.detect_particles(templates, 
                                                     noise_var_approx,
@@ -173,18 +257,7 @@ class KLTParticleDetector3D:
         M = int(self.patch_size)
         max_d = int(np.floor(0.3*M))
 
-        micro_size = np.min(source.shape)
-        m = int(np.floor(micro_size/ M))
-        if m < 1:
-            raise ValueError(
-                "tomogram dimensions must be at least as large as patch_size"
-            )
-
-        t = source[:m*M, :m*M, :m*M]
-        # (m*M, m*M, m*M) -> (m, M, m, M, m, M) -> (m, m, m, M, M, M)
-        patches = t.reshape(m, M, m, M, m, M).transpose(0, 2, 4, 1, 3, 5)
-        # Flatten patch index to match (m**3, M, M, M)
-        patches = patches.reshape(m**3, M, M, M)
+        patches = _extract_nonoverlapping_patches(source, M)
 
         patches = patches - jnp.mean(patches, axis=(1,2,3)).reshape(-1,1,1,1)
 
@@ -231,17 +304,20 @@ class KLTParticleDetector3D:
                     template_size)
                 eigvals: one eigenvalue for every returned angular mode
         """
-        a = self.template_radius_voxels
+        a = self.fredholm_radius_voxels
         c = self.bandlimit 
-        template_size = self.template_diameter
+        template_size = self.template_side
         K = self.legendre_order 
 
         radmax = np.floor((template_size-1)/2)
         grid = np.arange(-radmax,radmax+1,1)
         X,Y,Z = np.meshgrid(grid,grid,grid)
         r_tensor = np.sqrt(X**2 + Y**2 + Z**2)
-        #r_tensor = np.where(r_tensor > self.bandlimit, 0, r_tensor)
-        rho_uniform, idx = np.unique(r_tensor,return_inverse=True)
+        support_mask = r_tensor <= a
+        rho_uniform, idx = np.unique(
+            r_tensor[support_mask],
+            return_inverse=True,
+        )
 
         # Legendre roots for both integrals
         rho_leg, w = scipy.special.roots_legendre(K)
@@ -297,7 +373,11 @@ class KLTParticleDetector3D:
 
         # Shape: truncate_idx X rho_uniform.length 
         eigfuncs_uniform = np.einsum('bik,k,bk->bi', psi,W,eigfuncs) / eigvals[:,None]
-        radial_templates = eigfuncs_uniform[:,idx]
+        radial_templates = np.zeros(
+            (eigfuncs_uniform.shape[0],) + r_tensor.shape,
+            dtype=eigfuncs_uniform.dtype,
+        )
+        radial_templates[:, support_mask] = eigfuncs_uniform[:, idx]
 
         templates, radial_indices, m_values = (
             expand_spherical_harmonic_templates(
@@ -372,7 +452,7 @@ class KLTParticleDetector3D:
         # Distinct non-overlapping particles should have centers separated by
         # approximately one particle diameter. Suppress all competing maxima
         # within that distance to avoid duplicate picks from the same particle.
-        r_del = self.particle_diameter_voxels
+        r_del = self.nms_radius_voxels
         log_max = np.max(score_vol)
         eps = 1e-12
 

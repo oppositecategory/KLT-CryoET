@@ -31,16 +31,28 @@ def test_complete_detector_executes_with_cpu_jax():
         threshold=-1.0,
         max_iter=30,
         max_order=3,
-        template_size_fraction=0.8,
     )
     num_detected, picked = detector.process_tomogram()
     jax.block_until_ready(detector.whitened_tomogram)
 
     assert num_detected == 2
-    assert detector.score_mat.shape == (21, 21, 21)
+    assert detector.score_mat.shape == (19, 19, 19)
     assert np.isfinite(detector.score_mat).all()
     assert np.isfinite(np.asarray(detector.whitened_tomogram)).all()
     assert detector.noise_variance > 0
+    assert detector.patch_size == 5
+    assert np.isclose(detector.fredholm_radius_voxels, 2.8)
+    assert detector.template_side == 7
+
+    template_grid = np.arange(-3, 4)
+    z, y, x = np.meshgrid(
+        template_grid,
+        template_grid,
+        template_grid,
+        indexing="ij",
+    )
+    outside_support = np.sqrt(z**2 + y**2 + x**2) > 2.8
+    assert np.all(np.asarray(detector.templates)[:, outside_support] == 0)
 
     # The deterministic smoke volume should localize both centers to within
     # one voxel in each coordinate.

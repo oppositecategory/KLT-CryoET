@@ -73,6 +73,58 @@ def ranked_local_maxima_nms_3d(score_volume, radius, max_picks):
     )
 
 
+def bandpass_filter_3d(volume,
+                       low_fraction=0.05,
+                       high_fraction=0.05,
+                       normalize=True):
+    """Apply an isotropic 3D FFT band-pass relative to radial Nyquist.
+
+    ``low_fraction`` and ``high_fraction`` are fractions of the radial band
+    ``[0, pi]`` removed at the low- and high-frequency ends.  Frequencies in
+    the FFT cube outside the retained radial band are also removed.
+    """
+    if not 0 <= low_fraction < 1:
+        raise ValueError("low_fraction must lie in [0, 1)")
+    if not 0 <= high_fraction < 1:
+        raise ValueError("high_fraction must lie in [0, 1)")
+    if low_fraction + high_fraction >= 1:
+        raise ValueError("low_fraction + high_fraction must be less than 1")
+
+    volume = jnp.asarray(
+        volume,
+        dtype=jnp.result_type(volume, jnp.float32),
+    )
+    if volume.ndim != 3:
+        raise ValueError("volume must be three-dimensional")
+
+    centered = volume - jnp.mean(volume)
+    if normalize:
+        standard_deviation = jnp.std(centered)
+        centered = jnp.where(
+            standard_deviation > 0,
+            centered / standard_deviation,
+            centered,
+        )
+
+    frequencies = [
+        2 * jnp.pi * jnp.fft.fftfreq(size, d=1.0)
+        for size in volume.shape
+    ]
+    wz, wy, wx = jnp.meshgrid(*frequencies, indexing="ij")
+    radial_frequency = jnp.sqrt(wz**2 + wy**2 + wx**2)
+    low_cutoff = low_fraction * jnp.pi
+    high_cutoff = (1 - high_fraction) * jnp.pi
+    passband = (
+        (radial_frequency >= low_cutoff)
+        & (radial_frequency <= high_cutoff)
+    )
+
+    filtered = jnp.fft.ifftn(
+        jnp.fft.fftn(centered) * passband
+    ).real
+    return filtered - jnp.mean(filtered)
+
+
 def radial_average_jax(X, shell_ids, counts, nbins):
     x = X.ravel()
     ids = shell_ids.ravel()
