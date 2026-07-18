@@ -483,39 +483,3 @@ class KLTParticleDetector3D:
         num_picked_particles = particle_coords.shape[0]
 
         return num_picked_particles, particle_coords
-
-# def old_prewhiten_tomogram(tomograms, factorization):
-#     """ 
-#         The function whitens each sub-tomogram using the extracted noise spectrum.
-
-#         Args:
-#             tomograms: a tensor containing K sub-tomograms of length N
-#             factorization: A dataclass of type RPSDFactorization with ALS solution
-
-#         Returns: 
-#             whitened_tomograms: tensor containing K whitend sub-tomograms
-
-#     """
-#     _,N,_,_ = tomograms.shape
-    
-#     uniform_points, _ = generate_uniform_radial_sampling_points(N)
-#     noise_rpsd = factorization.v
-
-#     grid = jnp.arange(-(N-1), N) * jnp.pi / N
-#     i,j,k = jnp.meshgrid(grid,grid,grid)
-#     r_matrix = jnp.sqrt(i**2 + j**2 + k**2)
-#     magnitudes, idx = jnp.unique(r_matrix, return_inverse=True)
-#     nodes = magnitudes[magnitudes < uniform_points[-1]*jnp.pi]
-
-#     interpolated_noise_rpsd = trigonometric_interpolation(uniform_points*np.pi, noise_rpsd, nodes)
-#     noise_rpsd_mat = jnp.pad(interpolated_noise_rpsd, 
-#                       (0,
-#                        magnitudes.size - interpolated_noise_rpsd.size),
-#                       'constant',
-#                       constant_values=interpolated_noise_rpsd[-1])
-#     noise_rpsd_mat = jnp.reshape(noise_rpsd_mat[idx], [grid.size, grid.size, grid.size])
-    
-#     whitened_tomograms = vect_prewhite_patch(tomograms,noise_rpsd_mat)
-#     whitened_tomograms -= jnp.mean(whitened_tomograms)
-#     whitened_tomograms /= jnp.linalg.norm(whitened_tomograms)
-#     return whitened_tomograms
