@@ -1,118 +1,244 @@
-from functools import partial
+"""Isotropic autocorrelation and power-spectrum estimation in three dimensions."""
 
-from skimage.filters import window 
+from collections.abc import Sequence
 
-import jax 
-import jax.numpy as jnp 
-from jax.numpy.fft import fftn,ifftn,fftshift,ifftshift
+import jax
+import jax.numpy as jnp
+import numpy.typing as npt
+from skimage.filters import window
 
 
-def estimate_isotropic_powerspectrum_tensor(tomogram,max_d):
-    """ 
-    Estimates the isotropic power spectrum of a given 3D tomogram using the autocorrelation of the tomogram.
+def estimate_isotropic_powerspectrum_tensor(
+    tomogram: jax.Array | npt.ArrayLike,
+    max_d: int,
+) -> jax.Array:
+    """Estimate an isotropic 3D power-spectrum tensor from a cubic patch.
+
+    The estimator radially averages the unbiased spatial autocorrelation,
+    applies a Gaussian lag window, and Fourier transforms the resulting
+    centrosymmetric tensor. The spectrum is normalized to preserve the
+    patch's mean-centered spatial energy.
 
     Args:
-        tomogram: 3-dimensional tensor containing sample of noisy tomogram.
-        max_d: the maximum distance for the isotogrpic powerspectrum
+        tomogram: Cubic real-valued patch with shape ``(size, size, size)``.
+        max_d: Maximum ACF lag, in voxels. Values at least as large as the
+            patch are clipped to ``size - 1``.
 
     Returns:
-        p3: 3D Power Spectrum tensor
+        Nonnegative centered power-spectrum tensor with shape
+        ``(2 * size - 1,) * 3``.
+
+    Raises:
+        ValueError: If the patch is not a nonempty cube or ``max_d`` is not
+            positive.
     """
-    N,_,_ = tomogram.shape
+    patch = jnp.asarray(tomogram)
+    if patch.ndim != 3 or len(set(patch.shape)) != 1:
+        raise ValueError("tomogram must be a nonempty cubic 3D array")
+    size = patch.shape[0]
+    if size < 1:
+        raise ValueError("tomogram must be nonempty")
+    if max_d < 1:
+        raise ValueError("max_d must be positive")
+    max_distance = min(max_d, size - 1)
 
-    if max_d >= N:
-        max_d = N - 1 
-
-    r3 = estimate_isotropic_autocorrelation(tomogram,max_d)
-    w = jnp.array(window(('gaussian', max_d), (2*N-1,2*N-1,2*N-1)))
-    # An isotropic autocorrelation is real and centrosymmetric, so its Fourier
-    # transform is real up to roundoff. Constructing both lag endpoints below
-    # is what makes taking the real component valid.
-    p3 = jnp.real(cfftn(r3*w))
-    p3 = jnp.where(p3 < 0, 0, p3)
-    mean_energy = jnp.sum(jnp.square(tomogram - jnp.mean(tomogram))) / N**3
-    
-    # Normalize the 3D power spectrum to preserve mean energy
-    p3 = (p3/p3.sum())*mean_energy * p3.size
-    p3 = jnp.where(p3 < 0, 0, p3) 
-    return p3
-
-def estimate_isotropic_autocorrelation(tomogram, max_d):
-    N,_,_ = tomogram.shape
-
-    grid = jnp.arange(max_d+1)
-    i,j,k = jnp.meshgrid(grid,grid,grid)
-    d = i**2 + j**2 + k**2
-    valid_dists = jnp.where(d <= max_d ** 2)
-    dists = jnp.sort(jnp.unique(d[d <= max_d ** 2]))
-   
-    # A distance map such that i,j,k holds the index in dists
-    # of distance i**2 + j**2 + k**2
-    #idx = jitted_binarysearch(dists,d)
-    idx = jnp.searchsorted(dists,d,side='left')
-    dist_map = jnp.zeros(d.shape, dtype=jnp.int32)
-    dist_map = dist_map.at[valid_dists].set(idx[valid_dists])
-
-    # compute the ACF of the 1-constant siganl to count number of k1,k2,k3
-    # such that k1**2 + k2 ** 2 + k3 ** 2 = d 
-    mask = jnp.ones((N,N,N)) 
-    tmp = jnp.zeros((2*N-1,2*N-1,2*N-1))
-    tmp = tmp.at[:N,:N,:N].set(mask) 
-    c_padded = calculate_autocorrelation(tmp)
-    c = c_padded[:max_d+1,:max_d+1,:max_d+1]
-    c = jnp.round(c.real).astype(jnp.float32)
-    
-    tomogram_fft = jnp.zeros((2*N+1,2*N+1,2*N+1),dtype=jnp.complex64)
-    tomogram_fft = tomogram_fft.at[:N,:N,:N].set(tomogram)
-    tomogram_acf = calculate_autocorrelation(tomogram_fft).real
-    init = jnp.zeros((2,dists.shape[0]))
-    r,cnt = accumulate_acf_radially(tomogram_acf, dist_map, valid_dists,c,init)
-    nonzero_mask = (cnt != 0)
-    result = jnp.where(nonzero_mask, r / cnt, 0.0)
-    r3 = create_autocorrelation_tensor(result, dists, N, max_d)
-    return r3
-
-
-def create_autocorrelation_tensor(r, dists, N, max_d):
-    """Embed radial autocorrelation samples on a centered, symmetric grid."""
-    # Build the entire output lattice. In particular, both -max_d and +max_d
-    # are present; the previous half-open range omitted the positive endpoint.
-    grid = jnp.arange(-(N - 1), N)
-    i, j, k = jnp.meshgrid(grid, grid, grid, indexing="ij")
-    d = i**2 + j**2 + k**2
-    radial_idx = jnp.searchsorted(dists, d, side="left")
-    safe_idx = jnp.minimum(radial_idx, dists.size - 1)
-    inside_support = (
-        (d <= max_d**2)
-        & (radial_idx < dists.size)
-        & (dists[safe_idx] == d)
+    autocorrelation = estimate_isotropic_autocorrelation(
+        patch,
+        max_distance,
     )
-    r3 = jnp.where(inside_support, r[safe_idx], 0)
+    spectrum_shape = (2 * size - 1,) * 3
+    lag_window = jnp.asarray(
+        window(("gaussian", max_distance), spectrum_shape),
+        dtype=patch.real.dtype,
+    )
 
-    # This should already be exact from the radius-only construction. Keep the
-    # projection explicit so later changes cannot reintroduce an odd component.
-    return 0.5 * (r3 + jnp.flip(r3, axis=(0, 1, 2)))
+    # A real centrosymmetric ACF has a real Fourier transform up to numerical
+    # roundoff. Clipping removes small negative values caused by truncation.
+    power_spectrum = jnp.maximum(
+        jnp.real(cfftn(autocorrelation * lag_window)),
+        0,
+    )
+    mean_energy = jnp.mean(jnp.square(patch - jnp.mean(patch)))
+    spectral_mass = jnp.sum(power_spectrum)
+    safe_mass = jnp.maximum(
+        spectral_mass,
+        jnp.finfo(power_spectrum.dtype).tiny,
+    )
+    normalized_spectrum = power_spectrum * mean_energy * power_spectrum.size / safe_mass
+    return jnp.where(spectral_mass > 0, normalized_spectrum, 0)
 
-def cfftn(x):
-    return fftshift(fftn(ifftshift(x)))
 
-def calculate_autocorrelation(patch):
-    # Estimating the autocorrelation by Wiener-Khinchin theorem
-    patch_fft = fftn(patch)
-    acf = ifftn(patch_fft * jnp.conj(patch_fft))
-    return acf 
+def estimate_isotropic_autocorrelation(
+    tomogram: jax.Array | npt.ArrayLike,
+    max_d: int,
+) -> jax.Array:
+    """Estimate an unbiased isotropic ACF on a full centered lag grid.
 
-def accumulate_acf_radially(acf,dist_map,valid_dists,dists_counts,init):
-    """ The function transforms the autocorrelation function into it's
-        isotoropic form by averaging over all possible distances of given distance.
+    Args:
+        tomogram: Cubic patch with shape ``(size, size, size)``.
+        max_d: Maximum retained radial lag, in voxels.
+
+    Returns:
+        Real centrosymmetric ACF with shape ``(2 * size - 1,) * 3``.
+
+    Raises:
+        ValueError: If the input shape or maximum distance is invalid.
     """
-    def scan_fn(carry, idx):
-        i,j,k = idx
-        d = dist_map[i,j,k]
-        carry = carry.at[0,d].add(acf[i,j,k])
-        carry = carry.at[1,d].add(dists_counts[i,j,k])
-        return (carry,None) 
+    patch = jnp.asarray(tomogram)
+    if patch.ndim != 3 or len(set(patch.shape)) != 1:
+        raise ValueError("tomogram must be a nonempty cubic 3D array")
+    size = patch.shape[0]
+    if not 0 <= max_d < size:
+        raise ValueError("max_d must lie in [0, patch_size)")
 
-    vv = jnp.stack(valid_dists,axis=-1)
-    v, _ = jax.lax.scan(scan_fn,init,vv)
-    return v[0,...],v[1,...]
+    positive_lags = jnp.arange(max_d + 1)
+    lag_z, lag_y, lag_x = jnp.meshgrid(
+        positive_lags,
+        positive_lags,
+        positive_lags,
+        indexing="ij",
+    )
+    squared_radius = lag_z**2 + lag_y**2 + lag_x**2
+    valid_lags = jnp.where(squared_radius <= max_d**2)
+    squared_distances = jnp.unique(squared_radius[valid_lags])
+
+    radial_indices = jnp.searchsorted(
+        squared_distances,
+        squared_radius,
+        side="left",
+    )
+    distance_map = jnp.zeros(
+        squared_radius.shape,
+        dtype=jnp.int32,
+    )
+    distance_map = distance_map.at[valid_lags].set(radial_indices[valid_lags])
+
+    # The number of voxel pairs separated by a positive lag is analytic,
+    # avoiding a second FFT of an all-ones volume.
+    overlap_counts = ((size - lag_z) * (size - lag_y) * (size - lag_x)).astype(
+        patch.real.dtype
+    )
+
+    padded_shape = (2 * size - 1,) * 3
+    padded_patch = jnp.zeros(
+        padded_shape,
+        dtype=jnp.result_type(patch, jnp.complex64),
+    )
+    padded_patch = padded_patch.at[:size, :size, :size].set(patch)
+    patch_autocorrelation = calculate_autocorrelation(padded_patch).real
+
+    initial_accumulator = jnp.zeros(
+        (2, squared_distances.shape[0]),
+        dtype=patch_autocorrelation.dtype,
+    )
+    radial_sum, radial_count = accumulate_acf_radially(
+        patch_autocorrelation,
+        distance_map,
+        valid_lags,
+        overlap_counts,
+        initial_accumulator,
+    )
+    radial_autocorrelation = jnp.where(
+        radial_count > 0,
+        radial_sum / radial_count,
+        0,
+    )
+    return create_autocorrelation_tensor(
+        radial_autocorrelation,
+        squared_distances,
+        size,
+        max_d,
+    )
+
+
+def create_autocorrelation_tensor(
+    r: jax.Array | npt.ArrayLike,
+    dists: jax.Array | npt.ArrayLike,
+    N: int,
+    max_d: int,
+) -> jax.Array:
+    """Embed radial ACF samples on a centered, symmetric 3D grid.
+
+    Parameter names are retained for compatibility with existing notebooks.
+
+    Args:
+        r: Radial autocorrelation samples.
+        dists: Squared integer radii corresponding to ``r``.
+        N: Original cubic patch size.
+        max_d: Maximum supported spatial lag, in voxels.
+
+    Returns:
+        Centrosymmetric tensor with shape ``(2 * N - 1,) * 3``.
+    """
+    radial_values = jnp.asarray(r)
+    squared_distances = jnp.asarray(dists)
+    grid = jnp.arange(-(N - 1), N)
+    lag_z, lag_y, lag_x = jnp.meshgrid(
+        grid,
+        grid,
+        grid,
+        indexing="ij",
+    )
+    squared_radius = lag_z**2 + lag_y**2 + lag_x**2
+    radial_index = jnp.searchsorted(
+        squared_distances,
+        squared_radius,
+        side="left",
+    )
+    safe_index = jnp.minimum(
+        radial_index,
+        squared_distances.size - 1,
+    )
+    inside_support = (
+        (squared_radius <= max_d**2)
+        & (radial_index < squared_distances.size)
+        & (squared_distances[safe_index] == squared_radius)
+    )
+    autocorrelation = jnp.where(
+        inside_support,
+        radial_values[safe_index],
+        0,
+    )
+
+    # Keep the projection explicit so future changes cannot introduce an odd
+    # ACF component and therefore a spurious imaginary Fourier component.
+    return 0.5 * (autocorrelation + jnp.flip(autocorrelation, axis=(0, 1, 2)))
+
+
+def cfftn(values: jax.Array | npt.ArrayLike) -> jax.Array:
+    """Return the centered N-dimensional discrete Fourier transform."""
+    values = jnp.asarray(values)
+    return jnp.fft.fftshift(jnp.fft.fftn(jnp.fft.ifftshift(values)))
+
+
+def calculate_autocorrelation(
+    patch: jax.Array | npt.ArrayLike,
+) -> jax.Array:
+    """Calculate a cyclic autocorrelation using Wiener-Khinchin."""
+    patch_fft = jnp.fft.fftn(jnp.asarray(patch))
+    return jnp.fft.ifftn(patch_fft * jnp.conj(patch_fft))
+
+
+def accumulate_acf_radially(
+    acf: jax.Array,
+    dist_map: jax.Array,
+    valid_dists: Sequence[jax.Array],
+    dists_counts: jax.Array,
+    init: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Accumulate ACF values and overlap counts by squared radial distance.
+
+    Args:
+        acf: Autocorrelation tensor.
+        dist_map: Map from positive-lag coordinates to radial-bin indices.
+        valid_dists: Tuple of coordinate arrays identifying supported lags.
+        dists_counts: Number of overlapping voxel pairs at every positive lag.
+        init: Initial ``(2, num_radial_bins)`` accumulator.
+
+    Returns:
+        Radial ACF sums and corresponding overlap-count sums.
+    """
+    radial_bins = dist_map[tuple(valid_dists)]
+    radial_sum = init[0].at[radial_bins].add(acf[tuple(valid_dists)])
+    radial_count = init[1].at[radial_bins].add(dists_counts[tuple(valid_dists)])
+    return radial_sum, radial_count
