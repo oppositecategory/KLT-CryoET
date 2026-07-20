@@ -25,7 +25,10 @@ def estimate_isotropic_powerspectrum_tensor(tomogram,max_d):
 
     r3 = estimate_isotropic_autocorrelation(tomogram,max_d)
     w = jnp.array(window(('gaussian', max_d), (2*N-1,2*N-1,2*N-1)))
-    p3 = cfftn(r3*w).real
+    # An isotropic autocorrelation is real and centrosymmetric, so its Fourier
+    # transform is real up to roundoff. Constructing both lag endpoints below
+    # is what makes taking the real component valid.
+    p3 = jnp.real(cfftn(r3*w))
     p3 = jnp.where(p3 < 0, 0, p3)
     mean_energy = jnp.sum(jnp.square(tomogram - jnp.mean(tomogram))) / N**3
     
@@ -71,21 +74,24 @@ def estimate_isotropic_autocorrelation(tomogram, max_d):
 
 
 def create_autocorrelation_tensor(r, dists, N, max_d):
-    grid = jnp.arange(-max_d, max_d)
-    i, j, k = jnp.meshgrid(grid, grid, grid)
-    
+    """Embed radial autocorrelation samples on a centered, symmetric grid."""
+    # Build the entire output lattice. In particular, both -max_d and +max_d
+    # are present; the previous half-open range omitted the positive endpoint.
+    grid = jnp.arange(-(N - 1), N)
+    i, j, k = jnp.meshgrid(grid, grid, grid, indexing="ij")
     d = i**2 + j**2 + k**2
-    mask = d <= max_d**2
-    idx = jnp.searchsorted(dists, d, side="left")
-    r3 = jnp.zeros((2*N-1, 2*N-1, 2*N-1))
+    radial_idx = jnp.searchsorted(dists, d, side="left")
+    safe_idx = jnp.minimum(radial_idx, dists.size - 1)
+    inside_support = (
+        (d <= max_d**2)
+        & (radial_idx < dists.size)
+        & (dists[safe_idx] == d)
+    )
+    r3 = jnp.where(inside_support, r[safe_idx], 0)
 
-    idx1= idx[mask]
-    i1, j1, k1 = i[mask], j[mask],k[mask]
-    values = r[idx1]
-
-    x,y,z = (N - 1) + i1, (N-1) + j1, (N-1) + k1
-    r3 = r3.at[x, y, z].set(values)
-    return r3
+    # This should already be exact from the radius-only construction. Keep the
+    # projection explicit so later changes cannot reintroduce an odd component.
+    return 0.5 * (r3 + jnp.flip(r3, axis=(0, 1, 2)))
 
 def cfftn(x):
     return fftshift(fftn(ifftshift(x)))

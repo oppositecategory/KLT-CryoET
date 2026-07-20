@@ -78,6 +78,10 @@ target/
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# Downloaded Cryo-ET evaluation data
+data/tomotwin_2df7/
+.jupyter-tmp/
+
 # IPython
 profile_default/
 ipython_config.py
@@ -169,3 +173,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# tex processing
+output/
+tmp/
