@@ -30,7 +30,7 @@ from kltpicker_3d.tomogram import KLTParticleDetector3D
 from kltpicker_3d.utils import ranked_local_maxima_nms_3d
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "tomotwin_2df7"
 
 # Same optimized settings used by the end-to-end package experiment in

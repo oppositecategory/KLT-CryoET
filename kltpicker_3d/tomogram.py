@@ -1,46 +1,99 @@
-import numpy as np 
-import scipy
+"""End-to-end three-dimensional KLT particle detection."""
 
 import jax
-import jax.numpy as jnp 
+import jax.numpy as jnp
+import numpy as np
+import numpy.typing as npt
+from scipy.special import roots_legendre, spherical_jn
 
-from kltpicker_3d.alt_least_squares import alternating_least_squares_solver
-from kltpicker_3d.spectral_estimation import estimate_isotropic_powerspectrum_tensor
-from kltpicker_3d.fredholm_solver import solve_radial_fredholm_equation
-from kltpicker_3d.utils import * 
+from kltpicker_3d.alt_least_squares import (
+    alternating_least_squares_solver,
+)
+from kltpicker_3d.fredholm_solver import (
+    solve_radial_fredholm_equation,
+)
+from kltpicker_3d.spectral_estimation import (
+    estimate_isotropic_powerspectrum_tensor,
+)
+from kltpicker_3d.utils import (
+    bandpass_filter_3d,
+    calibrate_radial_psds,
+    expand_spherical_harmonic_templates,
+    generate_uniform_radial_sampling_points,
+    prewhiten_tomogram,
+    radial_average_jax,
+    radial_mode_truncation_index,
+    ranked_local_maxima_nms_3d,
+    trigonometric_interpolation,
+)
 
-# Compiled functions 
-vect_spectrum_estimation = jax.vmap(estimate_isotropic_powerspectrum_tensor,
-                                    in_axes=(0,None))
-vect_radial_average = jax.vmap(radial_average_jax,
-                               in_axes=(0,None,None,None))
+_ALS_CONVERGENCE_TOLERANCE = 1e-4
+_NOISE_PATCH_FRACTION = 0.25
+_PSD_ACF_DISTANCE_FRACTION = 0.3
+_TEMPLATE_ENERGY_FRACTION = 0.99
+
+_vectorized_spectrum_estimation = jax.vmap(
+    estimate_isotropic_powerspectrum_tensor,
+    in_axes=(0, None),
+)
+_vectorized_radial_average = jax.vmap(
+    radial_average_jax,
+    in_axes=(0, None, None, None),
+)
 
 
-def _extract_nonoverlapping_patches(volume, patch_size):
-    """Use every complete patch independently along all three axes."""
-    blocks = np.asarray(volume.shape, dtype=np.int64) // int(patch_size)
+def _odd_floor(value: float) -> int:
+    """Return the largest odd integer not greater than ``value``."""
+    size = int(np.floor(value))
+    return size if size % 2 else size - 1
+
+
+def _extract_nonoverlapping_patches(
+    volume: jax.Array | npt.ArrayLike,
+    patch_size: int,
+) -> jax.Array:
+    """Extract every complete cubic patch independently along each axis.
+
+    Args:
+        volume: Three-dimensional tomogram in ``(z, y, x)`` order.
+        patch_size: Cubic patch side length, in voxels.
+
+    Returns:
+        JAX array with shape
+        ``(num_patches, patch_size, patch_size, patch_size)``.
+
+    Raises:
+        ValueError: If ``volume`` is not 3D or any axis cannot fit one patch.
+    """
+    volume_array = jnp.asarray(volume)
+    if volume_array.ndim != 3:
+        raise ValueError("volume must be three-dimensional")
+    if patch_size < 1:
+        raise ValueError("patch_size must be positive")
+
+    blocks = np.asarray(volume_array.shape, dtype=np.int64) // patch_size
     if np.any(blocks < 1):
         raise ValueError(
             "all tomogram dimensions must be at least as large as patch_size"
         )
 
-    cropped_shape = blocks * int(patch_size)
-    cropped = volume[
-        :cropped_shape[0],
-        :cropped_shape[1],
-        :cropped_shape[2],
+    cropped_shape = blocks * patch_size
+    cropped = volume_array[
+        : cropped_shape[0],
+        : cropped_shape[1],
+        : cropped_shape[2],
     ]
-    bz, by, bx = (int(value) for value in blocks)
+    blocks_z, blocks_y, blocks_x = (int(value) for value in blocks)
     patches = cropped.reshape(
-        bz,
+        blocks_z,
         patch_size,
-        by,
+        blocks_y,
         patch_size,
-        bx,
+        blocks_x,
         patch_size,
     ).transpose(0, 2, 4, 1, 3, 5)
     return patches.reshape(
-        bz * by * bx,
+        blocks_z * blocks_y * blocks_x,
         patch_size,
         patch_size,
         patch_size,
@@ -48,75 +101,102 @@ def _extract_nonoverlapping_patches(volume, patch_size):
 
 
 class KLTParticleDetector3D:
-    """Detect particles in a tomogram using data-adaptive 3D KLT templates.
+    """Detect particles using data-adaptive three-dimensional KLT templates.
 
-    ``particle_diameter`` may be expressed in physical units (for example,
-    Angstrom).  ``mgscale`` is the corresponding conversion to voxels per
-    input unit.  All geometric calculations after initialization use the
-    derived ``*_voxels`` attributes exclusively.
+    ``particle_diameter`` may be expressed in physical units.
+    ``mgscale`` converts those units to voxels. All internal geometric
+    calculations use the derived voxel quantities.
     """
 
-    def __init__(self, 
-                 tomogram,
-                 particle_diameter: float,
-                 mgscale: float,
-                 num_particles: int, 
-                 legendre_order:int = 150,
-                 threshold: float = 0,
-                 max_iter: int = 500, 
-                 max_order: int = 10,
-                 psd_patch_size: int | None = None,
-                 fredholm_radius: float | None = None,
-                 template_side: int | None = None,
-                 bandpass_low_fraction: float = 0.05,
-                 bandpass_high_fraction: float = 0.05,
-                 nms_radius: float | None = None):
+    def __init__(
+        self,
+        tomogram: jax.Array | npt.ArrayLike,
+        particle_diameter: float,
+        mgscale: float,
+        num_particles: int,
+        legendre_order: int = 150,
+        threshold: float = 0,
+        max_iter: int = 500,
+        max_order: int = 10,
+        psd_patch_size: int | None = None,
+        fredholm_radius: float | None = None,
+        template_side: int | None = None,
+        bandpass_low_fraction: float = 0.05,
+        bandpass_high_fraction: float = 0.05,
+        nms_radius: float | None = None,
+    ) -> None:
+        """Initialize detector geometry and numerical settings.
+
+        Args:
+            tomogram: Input volume in ``(z, y, x)`` order.
+            particle_diameter: Particle diameter in input physical units.
+            mgscale: Voxels per input physical unit.
+            num_particles: Maximum requested picks, or ``-1`` to use only the
+                iteration limit and score threshold.
+            legendre_order: Gauss-Legendre quadrature order.
+            threshold: Minimum normalized score for a retained peak.
+            max_iter: Maximum ALS iterations and legacy maximum unconstrained
+                pick count.
+            max_order: Number of spherical-harmonic orders, starting at zero.
+            psd_patch_size: Optional odd PSD patch side, in voxels.
+            fredholm_radius: Optional Fredholm support radius, in voxels.
+            template_side: Optional odd template side, in voxels.
+            bandpass_low_fraction: Fraction of low radial frequencies removed.
+            bandpass_high_fraction: Fraction of high radial frequencies
+                removed.
+            nms_radius: Optional NMS center-distance radius, in voxels.
+
+        Raises:
+            ValueError: If the volume, geometry, or numerical settings are
+                invalid.
+        """
+        tomogram_array = jnp.asarray(
+            tomogram,
+            dtype=jnp.result_type(tomogram, jnp.float32),
+        )
+        if tomogram_array.ndim != 3:
+            raise ValueError("tomogram must be three-dimensional")
         if particle_diameter <= 0:
             raise ValueError("particle_diameter must be positive")
         if mgscale <= 0:
             raise ValueError("mgscale must be positive")
+        if num_particles < -1:
+            raise ValueError("num_particles must be -1 or nonnegative")
+        if legendre_order < 1:
+            raise ValueError("legendre_order must be positive")
+        if max_iter < 1:
+            raise ValueError("max_iter must be positive")
+        if max_order < 1:
+            raise ValueError("max_order must be positive")
 
-        self.tomogram = tomogram 
-        self.particle_diameter = float(particle_diameter)
-        self.mgscale = float(mgscale)
+        self.tomogram = tomogram_array
+        self.particle_diameter = particle_diameter
+        self.mgscale = mgscale
         self.max_order = max_order
         self.bandlimit = np.pi
-        self.bandpass_low_fraction = float(bandpass_low_fraction)
-        self.bandpass_high_fraction = float(bandpass_high_fraction)
+        self.bandpass_low_fraction = bandpass_low_fraction
+        self.bandpass_high_fraction = bandpass_high_fraction
 
         scaled_diameter = self.mgscale * self.particle_diameter
         self.particle_diameter_voxels = int(np.floor(scaled_diameter))
         self.nms_radius_voxels = (
-            0.5 * scaled_diameter
-            if nms_radius is None
-            else float(nms_radius)
+            0.5 * scaled_diameter if nms_radius is None else nms_radius
         )
         if self.nms_radius_voxels < 0:
             raise ValueError("nms_radius must be nonnegative")
 
-        def odd_floor(value):
-            size = int(np.floor(value))
-            return size if size % 2 else size - 1
-
-        default_patch_size = odd_floor(0.8 * scaled_diameter)
+        default_patch_size = _odd_floor(0.8 * scaled_diameter)
         self.patch_size = (
-            default_patch_size
-            if psd_patch_size is None
-            else int(psd_patch_size)
+            default_patch_size if psd_patch_size is None else psd_patch_size
         )
         self.fredholm_radius_voxels = (
-            0.4 * scaled_diameter
-            if fredholm_radius is None
-            else float(fredholm_radius)
+            0.4 * scaled_diameter if fredholm_radius is None else fredholm_radius
         )
-        default_template_side = (
-            2 * int(np.ceil(self.fredholm_radius_voxels)) + 1
-        )
+        default_template_side = 2 * int(np.ceil(self.fredholm_radius_voxels)) + 1
         self.template_side = (
-            default_template_side
-            if template_side is None
-            else int(template_side)
+            default_template_side if template_side is None else template_side
         )
+
         if self.patch_size < 3 or self.patch_size % 2 == 0:
             raise ValueError("psd_patch_size must be an odd integer at least 3")
         if self.fredholm_radius_voxels <= 0:
@@ -133,38 +213,45 @@ class KLTParticleDetector3D:
                 "particle_diameter * mgscale must span at least three voxels"
             )
 
-        # Backward-compatible names for downstream code that treats these as
-        # array dimensions. The Fredholm radius is intentionally independent.
+        # These legacy names are retained because experiment notebooks use
+        # them as array geometry rather than as independent model parameters.
         self.template_diameter = self.template_side
         self.template_radius_voxels = self.fredholm_radius_voxels
-        self.max_iter = max_iter 
-        
-        S = 2 * self.patch_size - 1
-        uniform_points, shell_ids, counts = generate_uniform_radial_sampling_points(S, self.bandlimit)
-        self.uniform_points = uniform_points
-        self.shell_ids = shell_ids
-        self.counts = counts
+        self.max_iter = max_iter
+
+        spectrum_size = 2 * self.patch_size - 1
+        (
+            self.uniform_points,
+            self.shell_ids,
+            self.counts,
+        ) = generate_uniform_radial_sampling_points(
+            spectrum_size,
+            self.bandlimit,
+        )
 
         self.legendre_order = legendre_order
         self.num_particles = num_particles
         self.threshold = threshold
 
-        self.eigvals = None 
-        self.eiguncs = None 
-        self.score_mat = None
-        self.preprocessed_tomogram = None
-        self.whitened_tomogram = None
-        self.initial_particle_psd = None
-        self.initial_noise_psd = None
-        self.particle_psd = None
-        self.noise_psd = None
-        self.noise_variance = None
-        self.radial_eigvals = None
-        self.template_orders = None
-        self.template_m_values = None
-        self.templates = None
+        self.eigvals: npt.NDArray[np.generic] | None = None
+        self.eigfuncs: npt.NDArray[np.generic] | None = None
+        self.score_mat: npt.NDArray[np.float64] | None = None
+        self.preprocessed_tomogram: jax.Array | None = None
+        self.whitened_tomogram: jax.Array | None = None
+        self.initial_particle_psd: npt.NDArray[np.float64] | None = None
+        self.initial_noise_psd: npt.NDArray[np.float64] | None = None
+        self.particle_psd: npt.NDArray[np.float64] | None = None
+        self.noise_psd: npt.NDArray[np.float64] | None = None
+        self.noise_variance: float | None = None
+        self.radial_eigvals: npt.NDArray[np.float64] | None = None
+        self.template_orders: npt.NDArray[np.int64] | None = None
+        self.template_m_values: npt.NDArray[np.int64] | None = None
+        self.templates: npt.NDArray[np.generic] | None = None
 
-    def process_tomogram(self):
+    def process_tomogram(
+        self,
+    ) -> tuple[int, npt.NDArray[np.float64]]:
+        """Run preprocessing, spectral estimation, templating, and picking."""
         self.preprocessed_tomogram = bandpass_filter_3d(
             self.tomogram,
             low_fraction=self.bandpass_low_fraction,
@@ -172,11 +259,14 @@ class KLTParticleDetector3D:
             normalize=True,
         )
 
-        # First estimate: calibrate the ALS spectra to spatial variances, then
-        # use the calibrated noise spectrum to prewhiten the full tomogram.
-        initial_particle_psd, initial_noise_psd, _ = self.factorize_RPSD(
-            self.preprocessed_tomogram
-        )
+        # The first estimate supplies the noise model used to whiten the full
+        # tomogram. The second estimate and scoring both use that same whitened
+        # representation.
+        (
+            initial_particle_psd,
+            initial_noise_psd,
+            _,
+        ) = self.factorize_rpsd(self.preprocessed_tomogram)
         self.initial_particle_psd = initial_particle_psd
         self.initial_noise_psd = initial_noise_psd
         self.whitened_tomogram = prewhiten_tomogram(
@@ -185,301 +275,494 @@ class KLTParticleDetector3D:
             initial_noise_psd,
         )
 
-        # Second estimate: the templates and likelihood scale must come from
-        # the same (whitened) data on which detection is performed.
-        particle_psd, noise_psd, noise_var_approx = self.factorize_RPSD(
-            self.whitened_tomogram
-        )
+        (
+            particle_psd,
+            noise_psd,
+            noise_variance,
+        ) = self.factorize_rpsd(self.whitened_tomogram)
         self.particle_psd = particle_psd
         self.noise_psd = noise_psd
-        self.noise_variance = noise_var_approx
-        
-        c = self.bandlimit 
-        a = self.fredholm_radius_voxels
-        K = self.legendre_order
-        X,w = scipy.special.roots_legendre(K)
-        X_scaled = c/2*X + c/2
-        Gx = trigonometric_interpolation(self.uniform_points, 
-                                        particle_psd, 
-                                        X_scaled)
-        # Trigonometric interpolation can overshoot slightly, but a PSD cannot
-        # be negative.
-        Gx = np.maximum(np.asarray(Gx), 0.0)
-        
-        eigvals, eigfuncs = [],[]
-        max_order = self.max_order
-        for i in range(max_order):
-            lambdas, funcs,W = solve_radial_fredholm_equation(
-                Gx,
-                i,
-                a,
-                c,
-                K=K,
-            )
-            eigvals.append(lambdas)
-            eigfuncs.append(funcs)
+        self.noise_variance = noise_variance
 
-        eigfuncs_matrix = np.asarray(eigfuncs)
-        eigvals = np.asarray(eigvals).reshape(-1)
-        # solve_radial_fredholm_equation returns one (K, K) matrix per
-        # angular order with eigenfunctions stored in columns.  Move the
-        # radial-mode axis before flattening so every function remains paired
-        # with its lambda_{ell,n} during the global sort.
-        eigfuncs = eigfuncs_matrix.transpose(0, 2, 1).reshape(-1, K)
-
-        orders = np.tile(np.arange(max_order).reshape(-1, 1), (1, K)).reshape(-1)
-
-        idx = np.argsort(eigvals)[::-1]
-        orders = orders[idx]
-
-        eigfuncs = eigfuncs[idx,:]
-        eigvals = eigvals[idx]
-
-        idx = np.where(eigvals > np.spacing(1))[0]
-        eigvals = eigvals[idx]
-        eigfuncs = eigfuncs[idx,:]
-        orders = orders[idx]
-
-        templates, eigvals = self.create_GPSF_templates(eigvals,
-                                                        eigfuncs,
-                                                        orders, 
-                                                        Gx)
+        (
+            radial_eigenvalues,
+            radial_eigenfunctions,
+            angular_orders,
+            particle_psd_nodes,
+        ) = self._solve_radial_modes(particle_psd)
+        templates, _ = self.create_gpsf_templates(
+            radial_eigenvalues,
+            radial_eigenfunctions,
+            angular_orders,
+            particle_psd_nodes,
+        )
         self.templates = templates
+        return self.detect_particles(
+            templates,
+            noise_variance,
+            self.whitened_tomogram,
+        )
 
-        num_detected,coords = self.detect_particles(templates, 
-                                                    noise_var_approx,
-                                                    self.whitened_tomogram)
-        return num_detected,coords
+    def _solve_radial_modes(
+        self,
+        particle_psd: npt.ArrayLike,
+    ) -> tuple[
+        npt.NDArray[np.float64],
+        npt.NDArray[np.generic],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.float64],
+    ]:
+        """Interpolate the particle PSD and solve every angular order."""
+        legendre_nodes, _ = roots_legendre(self.legendre_order)
+        frequency_nodes = (self.bandlimit / 2) * (legendre_nodes + 1)
+        particle_psd_nodes = np.maximum(
+            np.asarray(
+                trigonometric_interpolation(
+                    self.uniform_points,
+                    particle_psd,
+                    frequency_nodes,
+                )
+            ),
+            0,
+        )
 
-    def factorize_RPSD(self, tomogram=None):
-        """Estimate and variance-calibrate particle and noise radial PSDs."""
+        eigenvalue_blocks = []
+        eigenfunction_blocks = []
+        for angular_order in range(self.max_order):
+            eigenvalues, eigenfunctions, _ = solve_radial_fredholm_equation(
+                particle_psd_nodes,
+                angular_order,
+                self.fredholm_radius_voxels,
+                self.bandlimit,
+                K=self.legendre_order,
+            )
+            eigenvalue_blocks.append(eigenvalues)
+            eigenfunction_blocks.append(eigenfunctions)
+
+        eigenvalues = np.asarray(eigenvalue_blocks).reshape(-1)
+        # Each solver matrix stores eigenfunctions in columns. Move the radial
+        # mode axis before flattening so global sorting preserves pairing.
+        eigenfunctions = (
+            np.asarray(eigenfunction_blocks)
+            .transpose(0, 2, 1)
+            .reshape(-1, self.legendre_order)
+        )
+        angular_orders = np.repeat(
+            np.arange(self.max_order, dtype=np.int64),
+            self.legendre_order,
+        )
+
+        descending = np.argsort(eigenvalues)[::-1]
+        eigenvalues = eigenvalues[descending]
+        eigenfunctions = eigenfunctions[descending]
+        angular_orders = angular_orders[descending]
+
+        active = eigenvalues > np.spacing(1)
+        if not np.any(active):
+            raise ValueError("Fredholm solve returned no positive eigenvalues")
+        return (
+            eigenvalues[active],
+            eigenfunctions[active],
+            angular_orders[active],
+            particle_psd_nodes,
+        )
+
+    def factorize_rpsd(
+        self,
+        tomogram: jax.Array | npt.ArrayLike | None = None,
+    ) -> tuple[
+        npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
+        float,
+    ]:
+        """Estimate and variance-calibrate particle and noise radial PSDs.
+
+        Args:
+            tomogram: Optional volume to factorize. Defaults to the original
+                detector input.
+
+        Returns:
+            Calibrated particle RPSD, calibrated noise RPSD, and the robust
+            spatial noise-variance estimate.
+        """
         source = self.tomogram if tomogram is None else tomogram
-        M = int(self.patch_size)
-        max_d = int(np.floor(0.3*M))
+        max_distance = int(np.floor(_PSD_ACF_DISTANCE_FRACTION * self.patch_size))
+        patches = _extract_nonoverlapping_patches(
+            source,
+            self.patch_size,
+        )
+        patches = patches - jnp.mean(
+            patches,
+            axis=(1, 2, 3),
+            keepdims=True,
+        )
 
-        patches = _extract_nonoverlapping_patches(source, M)
-
-        patches = patches - jnp.mean(patches, axis=(1,2,3)).reshape(-1,1,1,1)
-
-        patches_var = jnp.var(patches,axis=(1,2,3))
-        sorted_patches_var = patches_var.sort()
+        patch_variances = jnp.var(patches, axis=(1, 2, 3))
+        sorted_patch_variances = jnp.sort(patch_variances)
         noise_patch_count = max(
             1,
-            int(np.floor(0.25 * patches_var.size)),
+            int(np.floor(_NOISE_PATCH_FRACTION * patch_variances.size)),
         )
-        noise_var_approx = jnp.mean(
-            sorted_patches_var[:noise_patch_count]
-        )
-        mean_patch_variance = jnp.mean(patches_var)
+        noise_variance = jnp.mean(sorted_patch_variances[:noise_patch_count])
+        mean_patch_variance = jnp.mean(patch_variances)
 
-        psds = vect_spectrum_estimation(patches,max_d)
-        #rblocks = np.array([radial_average(psds[k], bins, len(bins)) for k in range(patches.shape[0])])
-        rblocks = vect_radial_average(psds, self.shell_ids, self.counts,self.uniform_points.shape[0])
-        factorization = alternating_least_squares_solver(rblocks,self.max_iter,1e-4)
+        power_spectra = _vectorized_spectrum_estimation(
+            patches,
+            max_distance,
+        )
+        radial_spectra = _vectorized_radial_average(
+            power_spectra,
+            self.shell_ids,
+            self.counts,
+            self.uniform_points.shape[0],
+        )
+        factorization = alternating_least_squares_solver(
+            radial_spectra,
+            self.max_iter,
+            _ALS_CONVERGENCE_TOLERANCE,
+        )
         particle_psd, noise_psd = calibrate_radial_psds(
             self.uniform_points,
             factorization.gamma,
             factorization.v,
-            noise_var_approx,
-            mean_patch_variance,
+            float(noise_variance),
+            float(mean_patch_variance),
         )
-        return particle_psd, noise_psd, float(noise_var_approx)
+        return particle_psd, noise_psd, float(noise_variance)
 
-    def create_GPSF_templates(self,
-                              eigvals,
-                              eigfuncs,
-                              orders,
-                              G):
+    def factorize_RPSD(  # noqa: N802
+        self,
+        tomogram: jax.Array | npt.ArrayLike | None = None,
+    ) -> tuple[
+        npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
+        float,
+    ]:
+        """Call :meth:`factorize_rpsd` for backward compatibility."""
+        return self.factorize_rpsd(tomogram)
+
+    def create_gpsf_templates(
+        self,
+        eigenvalues: npt.ArrayLike,
+        eigenfunctions: npt.ArrayLike,
+        angular_orders: npt.ArrayLike,
+        particle_psd_nodes: npt.ArrayLike,
+    ) -> tuple[
+        npt.NDArray[np.generic],
+        npt.NDArray[np.generic],
+    ]:
+        """Generate complete generalized prolate spheroidal template modes.
+
+        Args:
+            eigenvalues: Descending positive radial KLT eigenvalues.
+            eigenfunctions: Radial eigenfunctions sampled at spatial
+                quadrature nodes.
+            angular_orders: Spherical-harmonic order of each radial mode.
+            particle_psd_nodes: Particle PSD at frequency quadrature nodes.
+
+        Returns:
+            Complete spherical-harmonic templates and one eigenvalue per
+            returned angular mode.
         """
-            Generates 3D templates in Generalized Prolate Spherodial Function basis
-            using radial solutions of KLT equations and their spectrum.
+        eigenvalues = np.asarray(eigenvalues)
+        eigenfunctions = np.asarray(eigenfunctions)
+        angular_orders = np.asarray(
+            angular_orders,
+            dtype=np.int64,
+        )
+        particle_psd_nodes = np.asarray(particle_psd_nodes)
 
-            args:
-                orders: the N orders of the corresponding solutions
-                G: particle function's radial PSD 
-            
-            returns:
-                templates: flattened complete spherical-harmonic multiplets,
-                    shaped (num_modes, template_size, template_size,
-                    template_size)
-                eigvals: one eigenvalue for every returned angular mode
-        """
-        a = self.fredholm_radius_voxels
-        c = self.bandlimit 
-        template_size = self.template_side
-        K = self.legendre_order 
+        support_radius = self.fredholm_radius_voxels
+        bandlimit = self.bandlimit
+        quadrature_order = self.legendre_order
 
-        radmax = np.floor((template_size-1)/2)
-        grid = np.arange(-radmax,radmax+1,1)
-        X,Y,Z = np.meshgrid(grid,grid,grid)
-        r_tensor = np.sqrt(X**2 + Y**2 + Z**2)
-        support_mask = r_tensor <= a
-        rho_uniform, idx = np.unique(
-            r_tensor[support_mask],
+        grid_radius = (self.template_side - 1) // 2
+        grid_axis = np.arange(-grid_radius, grid_radius + 1)
+        grid_z, grid_y, grid_x = np.meshgrid(
+            grid_axis,
+            grid_axis,
+            grid_axis,
+            indexing="ij",
+        )
+        radius_tensor = np.sqrt(grid_z**2 + grid_y**2 + grid_x**2)
+        support_mask = radius_tensor <= support_radius
+        uniform_radii, inverse_radius_indices = np.unique(
+            radius_tensor[support_mask],
             return_inverse=True,
         )
 
-        # Legendre roots for both integrals
-        rho_leg, w = scipy.special.roots_legendre(K)
-        rho_leg_a =  (a * 0.5) * rho_leg + a * 0.5 
-        rho_leg_c =  (c * 0.5)* rho_leg + c * 0.5
-        
-        # Each radial eigenvalue of order ell occurs for every
-        # m=-ell,...,ell. Account for that (2*ell+1)-fold degeneracy when
-        # retaining 99% of the covariance energy.
-        truncate_idx = radial_mode_truncation_index(
-            eigvals,
-            orders,
-            energy_fraction=0.99,
+        legendre_nodes, legendre_weights = roots_legendre(quadrature_order)
+        spatial_nodes = (support_radius / 2) * (legendre_nodes + 1)
+        frequency_nodes = (bandlimit / 2) * (legendre_nodes + 1)
+
+        truncation_index = radial_mode_truncation_index(
+            eigenvalues,
+            angular_orders,
+            energy_fraction=_TEMPLATE_ENERGY_FRACTION,
+        )
+        eigenfunctions = eigenfunctions[:truncation_index]
+        eigenvalues = eigenvalues[:truncation_index]
+        angular_orders = angular_orders[:truncation_index]
+
+        self.eigfuncs = eigenfunctions
+        self.radial_eigvals = eigenvalues
+
+        uniform_grid = np.outer(
+            uniform_radii,
+            frequency_nodes,
+        )
+        quadrature_grid = np.outer(
+            spatial_nodes,
+            frequency_nodes,
         )
 
-        eigfuncs = eigfuncs[:truncate_idx,...]
-        eigvals = eigvals[:truncate_idx,...]
-        orders = orders[:truncate_idx,...]
-
-        self.eigfuncs = eigfuncs 
-        self.radial_eigvals = eigvals
-
-        # We interpolate the radial solutions into uniform radial basis
-        # using the Fredholm equation (re-expressing new values of R_{N,m} using  
-        # values of it at Legendre roots.
-        r_grid_uni = np.outer(rho_uniform, rho_leg_c)
-        r_grid_leg = np.outer(rho_leg_a, rho_leg_c)
-
-        def Hn(x,N):
-            return 4*np.pi * ((1j**N) * scipy.special.spherical_jn(N,x))
-        
-        max_N = int(orders.max()) + 1
-
-        # Hn evaluated at multiples of uniform radial points in [0,a]
-        Hn_uniform = np.array(
-            [Hn(r_grid_uni,N) for N in range(max_N)]
-        )
-
-        # Hn evaluated at multiples Legendre roots in [0,a]
-        Hn_leg = np.array(
-            [Hn(r_grid_leg,N) for N in range(max_N)]
-        )
-
-        Hn_leg = Hn_leg[orders]
-        Hn_uniform = Hn_uniform[orders]
-
-        sgn = np.where(orders % 2 == 1, -1, 1)
-        D = c * 0.5* w * G * (rho_leg_c**2)
-        W = a * 0.5 * w* rho_leg_a**2
-
-        H_right = sgn[:,None,None]* Hn_leg
-        psi = (Hn_uniform * D[None,None,:]) @ H_right
-
-        # Shape: truncate_idx X rho_uniform.length 
-        eigfuncs_uniform = np.einsum('bik,k,bk->bi', psi,W,eigfuncs) / eigvals[:,None]
-        radial_templates = np.zeros(
-            (eigfuncs_uniform.shape[0],) + r_tensor.shape,
-            dtype=eigfuncs_uniform.dtype,
-        )
-        radial_templates[:, support_mask] = eigfuncs_uniform[:, idx]
-
-        templates, radial_indices, m_values = (
-            expand_spherical_harmonic_templates(
-                radial_templates,
-                orders,
-                X,
-                Y,
-                Z,
+        def radial_basis(
+            values: npt.ArrayLike,
+            order: int,
+        ) -> npt.NDArray[np.complex128]:
+            values_array = np.asarray(values)
+            return np.asarray(
+                4 * np.pi * (1j**order) * spherical_jn(order, values_array),
+                dtype=np.complex128,
             )
+
+        maximum_order = int(angular_orders.max()) + 1
+        uniform_bases = np.asarray(
+            [radial_basis(uniform_grid, order) for order in range(maximum_order)]
+        )[angular_orders]
+        quadrature_bases = np.asarray(
+            [radial_basis(quadrature_grid, order) for order in range(maximum_order)]
+        )[angular_orders]
+
+        parity_sign = np.where(
+            angular_orders % 2,
+            -1,
+            1,
         )
-        template_eigvals = eigvals[radial_indices]
+        frequency_weights = (
+            bandlimit / 2 * legendre_weights * particle_psd_nodes * frequency_nodes**2
+        )
+        spatial_weights = support_radius / 2 * legendre_weights * spatial_nodes**2
+        right_basis = parity_sign[:, None, None] * quadrature_bases
+        interpolation_operator = (
+            uniform_bases * frequency_weights[None, None, :]
+        ) @ right_basis
+        uniform_eigenfunctions = (
+            np.einsum(
+                "bik,k,bk->bi",
+                interpolation_operator,
+                spatial_weights,
+                eigenfunctions,
+                optimize=True,
+            )
+            / eigenvalues[:, None]
+        )
 
-        self.eigvals = template_eigvals
-        self.template_orders = orders[radial_indices]
+        radial_templates = np.zeros(
+            (uniform_eigenfunctions.shape[0], *radius_tensor.shape),
+            dtype=uniform_eigenfunctions.dtype,
+        )
+        radial_templates[:, support_mask] = uniform_eigenfunctions[
+            :,
+            inverse_radius_indices,
+        ]
+        (
+            templates,
+            radial_indices,
+            m_values,
+        ) = expand_spherical_harmonic_templates(
+            radial_templates,
+            angular_orders,
+            grid_x,
+            grid_y,
+            grid_z,
+        )
+        template_eigenvalues = eigenvalues[radial_indices]
+
+        self.eigvals = template_eigenvalues
+        self.template_orders = angular_orders[radial_indices]
         self.template_m_values = m_values
-        return templates, template_eigvals
-    
+        return templates, template_eigenvalues
 
-    def detect_particles(self,
-                         templates, 
-                         noise_var_approx,
-                         tomogram=None):
-        """ GPU-Accelerated particle detection.
-            Function apply FFT-based convolution to run each generated template-kernel across
-            the whole 3D tomogram. 
+    def create_GPSF_templates(  # noqa: N802
+        self,
+        eigvals: npt.ArrayLike,
+        eigfuncs: npt.ArrayLike,
+        orders: npt.ArrayLike,
+        G: npt.ArrayLike,
+    ) -> tuple[
+        npt.NDArray[np.generic],
+        npt.NDArray[np.generic],
+    ]:
+        """Call :meth:`create_gpsf_templates` for compatibility."""
+        return self.create_gpsf_templates(
+            eigvals,
+            eigfuncs,
+            orders,
+            G,
+        )
+
+    def detect_particles(
+        self,
+        templates: npt.ArrayLike,
+        noise_var_approx: float,
+        tomogram: jax.Array | npt.ArrayLike | None = None,
+    ) -> tuple[int, npt.NDArray[np.float64]]:
+        """Score the tomogram with KLT templates and pick local maxima.
+
+        Args:
+            templates: KLT templates with shape
+                ``(num_templates, z, y, x)``.
+            noise_var_approx: Positive spatial noise variance.
+            tomogram: Optional scoring volume. Defaults to the original input.
+
+        Returns:
+            Number of accepted particles and an array containing
+            ``(z, y, x, normalized_score)`` rows.
+
+        Raises:
+            RuntimeError: If template eigenvalues have not been initialized.
+            ValueError: If template or noise inputs are invalid.
         """
-        source = self.tomogram if tomogram is None else tomogram
-        n_templates, nx, ny, nz = templates.shape
-        psi = templates.reshape(n_templates, nx * ny * nz)
-        eigvals_r = jnp.asarray(self.eigvals)
-        if eigvals_r.size != n_templates:
+        if noise_var_approx <= 0:
+            raise ValueError("noise_var_approx must be positive")
+        if self.eigvals is None:
+            raise RuntimeError(
+                "template eigenvalues must be initialized before detection"
+            )
+
+        source = jnp.asarray(self.tomogram if tomogram is None else tomogram)
+        template_array = jnp.asarray(templates)
+        if template_array.ndim != 4:
+            raise ValueError("templates must have shape (num_templates, z, y, x)")
+        num_templates, size_z, size_y, size_x = template_array.shape
+        flattened_templates = template_array.reshape(
+            num_templates,
+            size_z * size_y * size_x,
+        )
+        template_eigenvalues = jnp.asarray(self.eigvals)
+        if template_eigenvalues.size != num_templates:
             raise ValueError(
                 "each spherical-harmonic template must have one eigenvalue"
             )
 
-        Q,R = jnp.linalg.qr(psi.T, mode="reduced")
-        H = (
-            (R * eigvals_r[None,:]) @ jnp.conj(R.T)
-            + noise_var_approx * jnp.eye(R.shape[0])
+        orthonormal_basis, triangular_factor = jnp.linalg.qr(
+            flattened_templates.T,
+            mode="reduced",
         )
-        H_eigvals,P = jnp.linalg.eigh(H)
-        D = (1.0/noise_var_approx) - (1.0/H_eigvals)
+        template_covariance = (
+            triangular_factor * template_eigenvalues[None, :]
+        ) @ jnp.conj(triangular_factor.T) + noise_var_approx * jnp.eye(
+            triangular_factor.shape[0],
+            dtype=triangular_factor.dtype,
+        )
+        covariance_eigenvalues, covariance_eigenvectors = jnp.linalg.eigh(
+            template_covariance
+        )
+        score_weights = 1.0 / noise_var_approx - 1.0 / covariance_eigenvalues
+        score_offset = jnp.linalg.slogdet(template_covariance / noise_var_approx)[1]
 
-        mu = jnp.linalg.slogdet((1/ noise_var_approx) * H)[1]
-        D, P = D[::-1],P[:,::-1]
-        B = Q @ P
-        num_kernels = B.shape[1]
-        kernels = B.T.reshape(num_kernels, nx,ny,nz)
+        score_weights = score_weights[::-1]
+        covariance_eigenvectors = covariance_eigenvectors[:, ::-1]
+        score_basis = orthonormal_basis @ covariance_eigenvectors
+        kernels = score_basis.T.reshape(
+            score_basis.shape[1],
+            size_z,
+            size_y,
+            size_x,
+        )
 
-        x_num = source.shape[0] - nx + 1
-        y_num = source.shape[1] - ny + 1
-        z_num = source.shape[2] - nz + 1
-        init = jnp.zeros((x_num, y_num, z_num), dtype=jnp.result_type(source, jnp.float32))
+        score_shape = tuple(
+            source_size - kernel_size + 1
+            for source_size, kernel_size in zip(
+                source.shape,
+                template_array.shape[1:],
+                strict=True,
+            )
+        )
+        if any(size < 1 for size in score_shape):
+            raise ValueError("templates cannot be larger than the tomogram")
+        initial_score = jnp.zeros(
+            score_shape,
+            dtype=jnp.result_type(source, jnp.float32),
+        )
 
-        def body(i, acc):
-            k = jnp.conj(jnp.flip(kernels[i], axis=(0,1,2)))
-            r = jax.scipy.signal.fftconvolve(source, k, mode="valid")
-            return acc + D[i] * (jnp.abs(r) ** 2)
+        def accumulate_kernel_score(
+            index: jax.Array,
+            score: jax.Array,
+        ) -> jax.Array:
+            kernel = jnp.conj(jnp.flip(kernels[index], axis=(0, 1, 2)))
+            response = jax.scipy.signal.fftconvolve(
+                source,
+                kernel,
+                mode="valid",
+            )
+            return score + score_weights[index] * jnp.square(jnp.abs(response))
 
-        score_mat = jax.lax.fori_loop(0, kernels.shape[0], body, init)
-        score_mat = np.array(score_mat - mu)
-        self.score_mat = score_mat 
-        num_particles, coords = self.picking_from_scoring_vol_3d(score_mat)
-        return num_particles, coords
-    
-    def picking_from_scoring_vol_3d(self, score_vol):
-        num_particles = self.num_particles
-        max_iter = self.max_iter
-        threshold = self.threshold
-        offset = self.template_diameter // 2 
+        score_matrix = jax.lax.fori_loop(
+            0,
+            kernels.shape[0],
+            accumulate_kernel_score,
+            initial_score,
+        )
+        self.score_mat = np.asarray(score_matrix - score_offset)
+        return self.picking_from_scoring_vol_3d(self.score_mat)
 
-        # Distinct non-overlapping particles should have centers separated by
-        # approximately one particle diameter. Suppress all competing maxima
-        # within that distance to avoid duplicate picks from the same particle.
-        r_del = self.nms_radius_voxels
-        log_max = np.max(score_vol)
-        eps = 1e-12
+    def picking_from_scoring_vol_3d(
+        self,
+        score_vol: npt.ArrayLike,
+    ) -> tuple[int, npt.NDArray[np.float64]]:
+        """Apply ranked local-maxima NMS to a detector score volume.
 
-        particle_list = []
+        Args:
+            score_vol: Three-dimensional valid-convolution score volume.
 
-        num_limit = np.inf if num_particles == -1 else int(num_particles)
-        pick_limit = int(min(max_iter, num_limit))
+        Returns:
+            Number of accepted picks and rows of
+            ``(z, y, x, normalized_score)``.
+        """
+        score_volume = np.asarray(score_vol)
+        if score_volume.ndim != 3:
+            raise ValueError("score_vol must be three-dimensional")
+        offset = self.template_side // 2
+        maximum_score = float(np.max(score_volume))
+        epsilon = np.finfo(np.float64).eps
+        score_scale = (
+            maximum_score
+            if abs(maximum_score) > epsilon
+            else np.copysign(epsilon, maximum_score or 1.0)
+        )
+
+        particle_limit = np.inf if self.num_particles == -1 else self.num_particles
+        pick_limit = int(min(self.max_iter, particle_limit))
         candidate_indices, candidate_values = ranked_local_maxima_nms_3d(
-            score_vol,
-            radius=r_del,
+            score_volume,
+            radius=self.nms_radius_voxels,
             max_picks=pick_limit,
         )
 
-        for (ix, iy, iz), p_max in zip(candidate_indices, candidate_values):
-            p_norm = p_max / (log_max + 1e-12)
-
-            if not (p_norm > threshold):
+        particles = []
+        for index, peak_score in zip(
+            candidate_indices,
+            candidate_values,
+            strict=True,
+        ):
+            normalized_score = float(peak_score / score_scale)
+            if normalized_score <= self.threshold:
                 break
+            center = index + offset
+            particles.append(
+                [
+                    float(center[0]),
+                    float(center[1]),
+                    float(center[2]),
+                    normalized_score,
+                ]
+            )
 
-            # Convert valid-score index -> tomogram center coordinate
-            cx = ix + offset
-            cy = iy + offset
-            cz = iz + offset
-
-            particle_list.append([cx, cy, cz, p_max / (log_max + eps)])
-
-        particle_coords = np.array(particle_list, dtype=np.float64) if particle_list else np.zeros((0, 4))
-        num_picked_particles = particle_coords.shape[0]
-
-        return num_picked_particles, particle_coords
+        particle_coordinates = (
+            np.asarray(particles, dtype=np.float64)
+            if particles
+            else np.zeros((0, 4), dtype=np.float64)
+        )
+        return particle_coordinates.shape[0], particle_coordinates

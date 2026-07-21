@@ -1,86 +1,222 @@
+"""Nonnegative rank-one factorization of radial power spectra."""
+
+from dataclasses import dataclass
+from functools import partial
+
 import jax
-import jax.numpy as jnp 
-from jax.numpy.linalg import norm
-from jax.random import uniform
+import jax.numpy as jnp
+
+_DEFAULT_RANDOM_SEED = 1701
 
 
-from dataclasses import dataclass 
-from functools import partial 
-
-@partial(jax.tree_util.register_dataclass,
-         data_fields=['alpha_prev', 'gamma_prev','v_prev',
-                      'alpha','gamma','v', 'iter_num'],
-         meta_fields=[])
+@partial(
+    jax.tree_util.register_dataclass,
+    data_fields=[
+        "alpha_prev",
+        "gamma_prev",
+        "v_prev",
+        "alpha",
+        "gamma",
+        "v",
+        "iter_num",
+    ],
+    meta_fields=[],
+)
 @dataclass
-class RPSDFactorization:
-    alpha_prev: jnp.ndarray 
-    gamma_prev: jnp.ndarray 
-    v_prev: jnp.ndarray 
+class RpsdFactorization:
+    """State and result of the alternating least-squares iteration.
 
-    alpha: jnp.ndarray 
-    gamma: jnp.ndarray 
-    v: jnp.ndarray
+    Attributes:
+        alpha_prev: Particle occupancy weights from the preceding iteration,
+            with shape ``(num_samples,)``.
+        gamma_prev: Particle RPSD from the preceding iteration, with shape
+            ``(num_frequencies,)``.
+        v_prev: Noise RPSD from the preceding iteration, with shape
+            ``(num_frequencies,)``.
+        alpha: Current particle occupancy weights.
+        gamma: Current nonnegative particle RPSD.
+        v: Current nonnegative noise RPSD.
+        iter_num: Number of completed ALS iterations.
+    """
 
-    iter_num: int = 0 
-   
-key = jax.random.key(1701)
-
-def alternating_least_squares_solver(samples, max_iter, eps):
-    M,n = samples.shape
-    S = samples.T
-
-    norms_1 = jnp.sum(jnp.abs(S),axis=0)
-    v = jnp.abs(S[:,jnp.argmin(norms_1)])
-    
-    # Faster approximation instead of computing the argmax of l2 error
-    norms_infty = jnp.max(jnp.abs(S),axis=0)
-    max_infty, min_infty = jnp.argmax(norms_infty), jnp.argmin(norms_infty)
-    gamma  = jnp.abs(S[:,max_infty] - S[:,min_infty])
-
-    alpha = jnp.dot(gamma, S - v[...,None]) / jnp.sum(gamma**2)
-    alpha = jnp.clip(alpha, 0, 1)
-
-    def alternating_least_squares_convergence(state): 
-        v_error = norm(state.v - state.v_prev) / norm(state.v)
-        gamma_error = norm(state.gamma - state.gamma_prev) / norm(state.gamma)
-        alpha_error = norm(state.alpha - state.alpha_prev) / norm(state.alpha)
-        return ((v_error >= eps) | (gamma_error >= eps) | (alpha_error >= eps)) & (state.iter_num < max_iter)
-
-    def alternating_least_squares_iteration(state):
-        alpha, gamma, v = state.alpha, state.gamma, state.v 
-
-        alpha = jax.lax.cond(norm(alpha) == 0, 
-                         lambda e: uniform(key, M,minval=0,maxval=1),
-                         lambda e: e,
-                         alpha)
-
-        gamma_new = jnp.dot(alpha, S.T - v[None,...])/ jnp.sum(alpha ** 2)
-        gamma_new = jnp.maximum(gamma_new, 0)
-
-        v_new = S - jnp.outer(gamma_new, alpha)
-        v_new = jnp.dot(v_new, jnp.ones(M)) / M
-        v_new = jnp.maximum(v_new, 0)
-
-        gamma_new = jax.lax.cond(norm(gamma_new) == 0,
-                             lambda e: uniform(key, n, minval=0, maxval=1),
-                             lambda e: e,
-                             gamma_new)
-
-        alpha_new = jnp.dot(gamma_new, S - v_new[...,None]) / jnp.sum(gamma_new ** 2 )
-        alpha_new = jnp.clip(alpha_new, 0, 1)
+    alpha_prev: jax.Array
+    gamma_prev: jax.Array
+    v_prev: jax.Array
+    alpha: jax.Array
+    gamma: jax.Array
+    v: jax.Array
+    iter_num: jax.Array | int = 0
 
 
-        return RPSDFactorization(alpha,gamma, v,
-                             alpha_new, gamma_new, v_new,
-                             state.iter_num+1)
-    
-    init_state = RPSDFactorization(jnp.zeros_like(alpha),
-                            jnp.zeros_like(gamma) , 
-                            jnp.zeros_like(v),
-                            alpha,
-                            gamma,
-                            v)
-    factorization = jax.lax.while_loop(alternating_least_squares_convergence,
-                           alternating_least_squares_iteration,
-                           init_state)
-    return factorization
+# Backward compatibility for notebooks and downstream imports.
+RPSDFactorization = RpsdFactorization
+
+
+def _safe_projection(
+    basis: jax.Array,
+    residuals: jax.Array,
+) -> jax.Array:
+    """Project residual columns onto a basis without dividing by zero."""
+    denominator = jnp.sum(jnp.square(basis))
+    safe_denominator = jnp.maximum(
+        denominator,
+        jnp.finfo(basis.dtype).tiny,
+    )
+    return jnp.dot(basis, residuals) / safe_denominator
+
+
+def _relative_change(current: jax.Array, previous: jax.Array) -> jax.Array:
+    """Return a numerically safe relative L2 change."""
+    denominator = jnp.maximum(
+        jnp.linalg.norm(current),
+        jnp.finfo(current.dtype).tiny,
+    )
+    return jnp.linalg.norm(current - previous) / denominator
+
+
+def alternating_least_squares_solver(
+    samples: jax.Array,
+    max_iter: int,
+    eps: float,
+    *,
+    key: jax.Array | None = None,
+) -> RpsdFactorization:
+    """Factor sample RPSDs into particle weights, particle PSD, and noise PSD.
+
+    The model is
+
+    ``samples[j, :] = alpha[j] * gamma[:] + v[:]``,
+
+    where ``alpha`` lies in ``[0, 1]`` and ``gamma`` and ``v`` are
+    nonnegative. The implementation uses JAX control flow so the iteration can
+    execute on an accelerator without Python-side synchronization.
+
+    Args:
+        samples: Radial spectra with shape
+            ``(num_samples, num_frequencies)``.
+        max_iter: Maximum number of ALS iterations.
+        eps: Relative convergence tolerance.
+        key: Optional JAX random key used only for degenerate zero-vector
+            recovery. A deterministic local key is used when omitted.
+
+    Returns:
+        Final factorization state.
+
+    Raises:
+        ValueError: If the inputs have invalid shape or parameter values.
+    """
+    samples = jnp.asarray(
+        samples,
+        dtype=jnp.result_type(samples, jnp.float32),
+    )
+    if samples.ndim != 2:
+        raise ValueError("samples must have shape (num_samples, num_frequencies)")
+    if 0 in samples.shape:
+        raise ValueError("samples must have nonempty sample and frequency axes")
+    if max_iter < 1:
+        raise ValueError("max_iter must be positive")
+    if eps <= 0:
+        raise ValueError("eps must be positive")
+
+    num_samples, num_frequencies = samples.shape
+    spectra = samples.T
+    key = jax.random.key(_DEFAULT_RANDOM_SEED) if key is None else key
+
+    l1_norms = jnp.sum(jnp.abs(spectra), axis=0)
+    noise_psd = jnp.abs(spectra[:, jnp.argmin(l1_norms)])
+
+    # The difference between the spectra with extreme L-infinity norms is a
+    # cheap, robust initialization for the nonnegative particle component.
+    linf_norms = jnp.max(jnp.abs(spectra), axis=0)
+    maximum_index = jnp.argmax(linf_norms)
+    minimum_index = jnp.argmin(linf_norms)
+    particle_psd = jnp.abs(spectra[:, maximum_index] - spectra[:, minimum_index])
+    weights = jnp.clip(
+        _safe_projection(
+            particle_psd,
+            spectra - noise_psd[:, None],
+        ),
+        0,
+        1,
+    )
+
+    def has_not_converged(state: RpsdFactorization) -> jax.Array:
+        errors = jnp.stack(
+            (
+                _relative_change(state.v, state.v_prev),
+                _relative_change(state.gamma, state.gamma_prev),
+                _relative_change(state.alpha, state.alpha_prev),
+            )
+        )
+        return jnp.logical_and(
+            jnp.any(errors >= eps),
+            state.iter_num < max_iter,
+        )
+
+    def update(state: RpsdFactorization) -> RpsdFactorization:
+        iteration_key = jax.random.fold_in(key, state.iter_num)
+        weights_key, particle_key = jax.random.split(iteration_key)
+
+        stable_weights = jax.lax.cond(
+            jnp.linalg.norm(state.alpha) == 0,
+            lambda _: jax.random.uniform(
+                weights_key,
+                (num_samples,),
+                dtype=samples.dtype,
+            ),
+            lambda value: value,
+            state.alpha,
+        )
+
+        new_particle_psd = jnp.maximum(
+            _safe_projection(
+                stable_weights,
+                spectra.T - state.v[None, :],
+            ),
+            0,
+        )
+        new_noise_psd = jnp.maximum(
+            jnp.mean(
+                spectra - jnp.outer(new_particle_psd, stable_weights),
+                axis=1,
+            ),
+            0,
+        )
+        stable_particle_psd = jax.lax.cond(
+            jnp.linalg.norm(new_particle_psd) == 0,
+            lambda _: jax.random.uniform(
+                particle_key,
+                (num_frequencies,),
+                dtype=samples.dtype,
+            ),
+            lambda value: value,
+            new_particle_psd,
+        )
+        new_weights = jnp.clip(
+            _safe_projection(
+                stable_particle_psd,
+                spectra - new_noise_psd[:, None],
+            ),
+            0,
+            1,
+        )
+
+        return RpsdFactorization(
+            alpha_prev=stable_weights,
+            gamma_prev=state.gamma,
+            v_prev=state.v,
+            alpha=new_weights,
+            gamma=stable_particle_psd,
+            v=new_noise_psd,
+            iter_num=state.iter_num + 1,
+        )
+
+    initial_state = RpsdFactorization(
+        alpha_prev=jnp.zeros_like(weights),
+        gamma_prev=jnp.zeros_like(particle_psd),
+        v_prev=jnp.zeros_like(noise_psd),
+        alpha=weights,
+        gamma=particle_psd,
+        v=noise_psd,
+    )
+    return jax.lax.while_loop(has_not_converged, update, initial_state)
