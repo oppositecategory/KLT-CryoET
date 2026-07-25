@@ -32,11 +32,14 @@ def test_streamed_rpsds_match_in_memory_patch_reduction():
         halo=1,
     )
 
-    result = ShardedRpsdEstimator(
+    estimator = ShardedRpsdEstimator(
         ArrayVolumeSource(volume),
         config,
         devices=(jax.devices()[0],),
-    ).extract()
+    )
+    assert estimator.subvolume_grid_shape == (2, 2, 2)
+    assert estimator.round_count == 8
+    result = estimator.extract()
 
     blocks = np.asarray(volume.shape) // patch_size
     cropped = volume[

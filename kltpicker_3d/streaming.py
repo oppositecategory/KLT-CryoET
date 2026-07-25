@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import numpy.typing as npt
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from tqdm import tqdm
 
 from kltpicker_3d.spectral_estimation import (
     estimate_isotropic_powerspectrum_tensor,
@@ -443,6 +444,24 @@ class ShardedRpsdEstimator:
         """Return bytes held by the reusable input buffer."""
         return self._host_subvolumes.nbytes
 
+    @property
+    def subvolume_grid_shape(self) -> tuple[int, int, int]:
+        """Return the number of streamed subvolumes along each patch-grid axis."""
+        return tuple(
+            (grid_size + core_size - 1) // core_size
+            for grid_size, core_size in zip(
+                self.patch_grid_shape,
+                self.config.core_patch_shape,
+                strict=True,
+            )
+        )
+
+    @property
+    def round_count(self) -> int:
+        """Return the number of synchronous multi-device streaming rounds."""
+        task_count = int(np.prod(self.subvolume_grid_shape))
+        return (task_count + len(self.devices) - 1) // len(self.devices)
+
     def _build_sharded_step(
         self,
     ) -> Callable[
@@ -480,6 +499,9 @@ class ShardedRpsdEstimator:
         ) -> tuple[jax.Array, jax.Array]:
             halo = config.halo
             core_z, core_y, core_x = config.core_shape
+            # The RPSD kernel works on complete, internally zero-padded
+            # patches. A streamed-volume halo is intentionally excluded here;
+            # it is only relevant to future cross-subvolume filtering stages.
             core = jax.lax.dynamic_slice(
                 loaded,
                 (halo, halo, halo),
@@ -546,7 +568,12 @@ class ShardedRpsdEstimator:
         )
         variance_grid = np.empty(self.patch_grid_shape, dtype=np.float32)
 
-        for tasks in self._task_rounds():
+        for tasks in tqdm(
+            self._task_rounds(),
+            total=self.round_count,
+            desc="RPSD extraction",
+            unit="round",
+        ):
             self._fill_round(tasks)
             device_subvolumes = jax.device_put(
                 self._host_subvolumes,
