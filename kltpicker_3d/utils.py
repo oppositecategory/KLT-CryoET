@@ -149,9 +149,11 @@ def radial_average_jax(
     ids = jnp.asarray(shell_ids).ravel()
     shell_counts = jnp.asarray(counts)
     mask = ids >= 0
+    safe_ids = jnp.where(mask, ids, 0)
+    masked_values = jnp.where(mask, values, 0)
     sums = jnp.bincount(
-        ids[mask],
-        weights=values[mask],
+        safe_ids,
+        weights=masked_values,
         length=nbins,
     )
     return jnp.where(
