@@ -95,7 +95,14 @@ def parse_args() -> argparse.Namespace:
         help="Static local-max output capacity; overflow fails explicitly.",
     )
     parser.add_argument("--legendre-order", type=int, default=150)
-    parser.add_argument("--max-order", type=int, default=10)
+    parser.add_argument(
+        "--max-order",
+        type=int,
+        default=4,
+        help="Number of angular orders; default retains ell=0,1,2,3.",
+    )
+    parser.add_argument("--template-energy-fraction", type=float, default=0.99)
+    parser.add_argument("--max-templates", type=int, default=1000)
     parser.add_argument("--max-iterations", type=int, default=500)
     parser.add_argument(
         "--threshold",
@@ -106,6 +113,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fredholm-radius", type=float)
     parser.add_argument("--template-side", type=int)
     parser.add_argument("--nms-radius", type=float)
+    parser.add_argument("--score-template-batch-size", type=int)
+    parser.add_argument("--score-memory-fraction", type=float, default=0.8)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -353,17 +362,31 @@ def checkpointed_stage(
 
 def log_array(name: str, value: npt.ArrayLike) -> None:
     """Log shape, dtype, range, and finite status for an analysis array."""
-    array = np.asarray(value)
-    finite = np.isfinite(array)
-    if array.size and np.any(finite):
-        minimum = float(np.min(np.real(array[finite])))
-        maximum = float(np.max(np.real(array[finite])))
+    array = np.asanyarray(value)
+    finite_count = 0
+    minimum = np.inf
+    maximum = -np.inf
+    chunks = (
+        (array[index] for index in range(array.shape[0]))
+        if array.ndim and array.nbytes > 256 * 2**20
+        else (array,)
+    )
+    for chunk in chunks:
+        chunk_array = np.asarray(chunk)
+        finite = np.isfinite(chunk_array)
+        count = int(np.sum(finite))
+        finite_count += count
+        if count:
+            real_values = np.real(chunk_array[finite])
+            minimum = min(minimum, float(np.min(real_values)))
+            maximum = max(maximum, float(np.max(real_values)))
+    if array.size and finite_count:
         LOGGER.info(
             "%s | shape=%s dtype=%s finite=%d/%d range=[%.6g, %.6g]",
             name,
             array.shape,
             array.dtype,
-            int(np.sum(finite)),
+            finite_count,
             array.size,
             minimum,
             maximum,
@@ -487,9 +510,14 @@ def log_plan(
         detector.patches_per_microbatch,
     )
     LOGGER.info(
-        "KLT: Legendre=%d | angular orders=%d | template=%d^3",
+        "KLT: Legendre=%d | angular orders=%d (ell=0..%d) | "
+        "energy=%.3f | template cap=%s | Fredholm radius=%.2f | template=%d^3",
         detector.model.legendre_order,
         detector.model.max_order,
+        detector.model.max_order - 1,
+        detector.model.template_energy_fraction,
+        detector.model.max_templates,
+        detector.model.fredholm_radius_voxels,
         detector.model.template_side,
     )
     LOGGER.info(
@@ -505,10 +533,14 @@ def log_plan(
         processor.loaded_shape(scoring_halo),
     )
     LOGGER.info(
-        "Schedule: subvolume grid=%s | rounds=%d | scoring host buffer=%.2f GiB",
+        "Schedule: subvolume grid=%s | RPSD rounds=%d | scoring subvolumes=%d | "
+        "single scoring input=%.2f GiB",
         processor.subvolume_grid_shape,
         processor.round_count,
-        processor.host_buffer_bytes(scoring_halo) / 2**30,
+        processor.subvolume_count,
+        int(np.prod(processor.loaded_shape(scoring_halo)))
+        * np.dtype(np.float32).itemsize
+        / 2**30,
     )
     LOGGER.info(
         "Candidates: static capacity/subvolume=%d | threshold=%s | NMS radius=%.2f",
@@ -594,9 +626,13 @@ def main() -> None:
                 threshold=args.threshold,
                 max_iter=args.max_iterations,
                 max_order=args.max_order,
+                template_energy_fraction=args.template_energy_fraction,
+                max_templates=args.max_templates,
                 fredholm_radius=args.fredholm_radius,
                 template_side=args.template_side,
                 nms_radius=args.nms_radius,
+                score_template_batch_size=args.score_template_batch_size,
+                score_memory_fraction=args.score_memory_fraction,
             )
             log_plan(args, detector, voxel_size, header_spacing, truth_count)
             LOGGER.info(
@@ -617,6 +653,12 @@ def main() -> None:
                 "devices": [device.device_kind for device in devices],
                 "whitening_support_radius": args.whitening_support_radius,
                 "template_side": detector.model.template_side,
+                "fredholm_radius_voxels": detector.model.fredholm_radius_voxels,
+                "max_order": detector.model.max_order,
+                "template_energy_fraction": args.template_energy_fraction,
+                "max_templates": args.max_templates,
+                "score_template_batch_size": args.score_template_batch_size,
+                "score_memory_fraction": args.score_memory_fraction,
                 "nms_radius_voxels": detector.model.nms_radius_voxels,
                 "match_radius_angstrom": match_radius_angstrom,
                 "match_radius_voxels": match_radius_voxels,
@@ -766,6 +808,11 @@ def main() -> None:
                     ),
                 )
                 save_npy(detector.templates, templates_path)
+                detector.templates = np.load(
+                    templates_path,
+                    mmap_mode="r",
+                    allow_pickle=False,
+                )
                 save_npz(
                     template_metadata_path,
                     template_eigenvalues=detector.model.eigvals,
@@ -773,6 +820,30 @@ def main() -> None:
                     radial_eigenfunctions=detector.model.eigfuncs,
                     template_orders=detector.model.template_orders,
                     template_m_values=detector.model.template_m_values,
+                    available_radial_mode_count=np.asarray(
+                        detector.model.available_radial_mode_count
+                    ),
+                    available_template_count=np.asarray(
+                        detector.model.available_template_count
+                    ),
+                    retained_radial_mode_count=np.asarray(
+                        detector.model.retained_radial_mode_count
+                    ),
+                    retained_template_count=np.asarray(
+                        detector.model.retained_template_count
+                    ),
+                    retained_template_energy_fraction=np.asarray(
+                        detector.model.retained_template_energy_fraction
+                    ),
+                    template_energy_fraction_config=np.asarray(
+                        detector.model.template_energy_fraction
+                    ),
+                    max_order_config=np.asarray(detector.model.max_order),
+                    max_templates_config=np.asarray(
+                        -1
+                        if detector.model.max_templates is None
+                        else detector.model.max_templates
+                    ),
                 )
             record_stage_time(stage_times, "templates", elapsed)
             with np.load(template_metadata_path, allow_pickle=False) as metadata:
@@ -791,15 +862,135 @@ def main() -> None:
                 detector.model.template_m_values = metadata[
                     "template_m_values"
                 ].copy()
+                for name in (
+                    "available_radial_mode_count",
+                    "available_template_count",
+                    "retained_radial_mode_count",
+                    "retained_template_count",
+                    "retained_template_energy_fraction",
+                ):
+                    if name in metadata:
+                        setattr(detector.model, name, metadata[name].item())
+            if detector.model.eigvals.shape != (detector.templates.shape[0],):
+                raise RuntimeError(
+                    "template checkpoint metadata does not match the template "
+                    "array; rerun stage 6 with --overwrite"
+                )
+            if np.any(detector.model.template_orders >= detector.model.max_order):
+                raise RuntimeError(
+                    "template checkpoint contains angular orders excluded by "
+                    "the current --max-order; rerun stage 6 with --overwrite"
+                )
+            if (
+                detector.model.max_templates is not None
+                and detector.templates.shape[0] > detector.model.max_templates
+            ):
+                raise RuntimeError(
+                    "template checkpoint exceeds the current --max-templates; "
+                    "rerun stage 6 with --overwrite"
+                )
+            with np.load(template_metadata_path, allow_pickle=False) as metadata:
+                if (
+                    "template_energy_fraction_config" in metadata
+                    and not np.isclose(
+                        metadata["template_energy_fraction_config"].item(),
+                        detector.model.template_energy_fraction,
+                    )
+                ):
+                    raise RuntimeError(
+                        "template checkpoint uses a different energy fraction; "
+                        "rerun stage 6 with --overwrite"
+                    )
+                if (
+                    "max_order_config" in metadata
+                    and metadata["max_order_config"].item()
+                    != detector.model.max_order
+                ):
+                    raise RuntimeError(
+                        "template checkpoint uses a different max_order; "
+                        "rerun stage 6 with --overwrite"
+                    )
+                configured_cap = (
+                    -1
+                    if detector.model.max_templates is None
+                    else detector.model.max_templates
+                )
+                if (
+                    "max_templates_config" in metadata
+                    and metadata["max_templates_config"].item() != configured_cap
+                ):
+                    raise RuntimeError(
+                        "template checkpoint uses a different template cap; "
+                        "rerun stage 6 with --overwrite"
+                    )
             log_array("KLT templates", detector.templates)
             log_array("Template eigenvalues", detector.model.eigvals)
             LOGGER.info(
-                "Templates: modes=%d | spatial shape=%s",
+                "Templates: complete modes=%d | radial modes=%s | "
+                "available complete=%s | retained energy=%s | spatial shape=%s",
                 detector.templates.shape[0],
+                detector.model.retained_radial_mode_count,
+                detector.model.available_template_count,
+                (
+                    "unknown"
+                    if detector.model.retained_template_energy_fraction is None
+                    else f"{detector.model.retained_template_energy_fraction:.6f}"
+                ),
                 detector.templates.shape[1:],
             )
 
+            score_model_path = args.results_dir / "06_score_model.npz"
+            if args.resume and score_model_path.is_file():
+                LOGGER.info(
+                    "STAGE RESUME | orthogonal KLT score model | loading %s",
+                    score_model_path,
+                )
+                with np.load(score_model_path, allow_pickle=False) as score_model:
+                    if (
+                        "noise_variance" in score_model
+                        and not np.isclose(
+                            score_model["noise_variance"].item(),
+                            detector.whitened_model.noise_variance,
+                        )
+                    ):
+                        raise RuntimeError(
+                            "score-model checkpoint uses a different noise "
+                            "variance; rerun stage 6b with --overwrite"
+                        )
+                    detector.template_normalization = score_model[
+                        "template_normalization"
+                    ].copy()
+                    detector.score_weights = score_model["score_weights"].copy()
+                    detector.score_offset = np.float32(score_model["score_offset"])
+                    detector.adjusted_template_eigenvalues = score_model[
+                        "adjusted_template_eigenvalues"
+                    ].copy()
+            else:
+                require_replaceable((score_model_path,), overwrite=args.overwrite)
+                run_stage(
+                    "6b/8 orthogonal KLT score-filter normalization",
+                    lambda: detector.prepare_score_filters(
+                        detector.templates,
+                        detector.whitened_model.noise_variance,
+                    ),
+                )
+                save_npz(
+                    score_model_path,
+                    template_normalization=detector.template_normalization,
+                    score_weights=detector.score_weights,
+                    score_offset=np.asarray(detector.score_offset),
+                    adjusted_template_eigenvalues=(
+                        detector.adjusted_template_eigenvalues
+                    ),
+                    noise_variance=np.asarray(
+                        detector.whitened_model.noise_variance
+                    ),
+                )
+            log_array("KLT score weights", detector.score_weights)
+            LOGGER.info("KLT likelihood offset: %.8g", detector.score_offset)
+
             candidates_path = args.results_dir / "07_candidates.npy"
+            score_plan_path = args.results_dir / "07_score_plan.json"
             if args.resume and candidates_path.is_file():
                 LOGGER.info(
                     "STAGE RESUME | scoring candidates | loading %s",
@@ -809,7 +1000,7 @@ def main() -> None:
                 elapsed = 0.0
             else:
                 require_replaceable(
-                    (candidates_path,),
+                    (candidates_path, score_plan_path),
                     overwrite=args.overwrite,
                 )
                 detector.candidates, elapsed = run_stage(
@@ -821,6 +1012,8 @@ def main() -> None:
                     ),
                 )
                 save_npy(detector.candidates, candidates_path)
+                if detector.score_plan is not None:
+                    save_json(detector.score_plan, score_plan_path)
             record_stage_time(stage_times, "scoring", elapsed)
             LOGGER.info(
                 "Candidates returned from all GPUs: %d",

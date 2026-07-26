@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import partial
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import numpy.typing as npt
+from tqdm import tqdm
 
 from kltpicker_3d.alt_least_squares import alternating_least_squares_solver
 from kltpicker_3d.streaming import (
@@ -32,6 +35,11 @@ from kltpicker_3d.utils import (
 _ALS_CONVERGENCE_TOLERANCE = 1e-4
 _NOISE_PATCH_FRACTION = 0.25
 _LOCAL_MAXIMUM_RADIUS = 1
+_TEMPLATE_AXIS_NAME = "template_device"
+_DEFAULT_SCORE_MEMORY_FRACTION = 0.8
+_SCORE_FIXED_COMPLEX_ARRAYS = 5
+_SCORE_BATCH_COMPLEX_ARRAYS = 3
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -93,49 +101,141 @@ def fit_streamed_rpsds(
     )
 
 
-def construct_klt_score_filters(
+def orthogonal_klt_score_parameters(
     templates: npt.ArrayLike,
     template_eigenvalues: npt.ArrayLike,
     noise_variance: float,
 ) -> tuple[
-    npt.NDArray[np.generic],
+    npt.NDArray[np.float32],
     npt.NDArray[np.float32],
     np.float32,
+    npt.NDArray[np.float64],
 ]:
-    """Convert KLT templates into convolution kernels and score weights."""
+    """Return normalization, weights, and offset for orthogonal KLT modes.
+
+    Fredholm eigenfunctions are orthonormal in the continuous weighted
+    problem. Each sampled Cartesian template is normalized independently;
+    the corresponding covariance eigenvalue is rescaled so this operation
+    leaves its rank-one covariance contribution unchanged. Cross-template
+    voxel correlations are intentionally ignored.
+    """
     templates = np.asarray(templates)
-    eigenvalues = np.asarray(template_eigenvalues)
+    eigenvalues = np.asarray(template_eigenvalues, dtype=np.float64)
     if templates.ndim != 4 or templates.shape[0] < 1:
         raise ValueError("templates must have shape (modes, z, y, x)")
     if len(set(templates.shape[1:])) != 1 or templates.shape[1] % 2 == 0:
         raise ValueError("templates must have an odd cubic spatial shape")
     if eigenvalues.shape != (templates.shape[0],):
         raise ValueError("each template must have one eigenvalue")
+    if not np.all(np.isfinite(eigenvalues)) or np.any(eigenvalues < 0):
+        raise ValueError("template eigenvalues must be finite and nonnegative")
     if noise_variance <= 0:
         raise ValueError("noise_variance must be positive")
+    if not np.isfinite(noise_variance):
+        raise ValueError("noise_variance must be finite")
 
-    flattened = jnp.asarray(templates).reshape(templates.shape[0], -1)
-    eigenvalues_jax = jnp.asarray(eigenvalues)
-    orthonormal_basis, triangular_factor = jnp.linalg.qr(
-        flattened.T,
-        mode="reduced",
-    )
-    covariance = (
-        triangular_factor * eigenvalues_jax[None, :]
-    ) @ jnp.conj(triangular_factor.T) + noise_variance * jnp.eye(
-        triangular_factor.shape[0],
-        dtype=triangular_factor.dtype,
-    )
-    covariance_values, covariance_vectors = jnp.linalg.eigh(covariance)
+    norm_squared = np.empty(templates.shape[0], dtype=np.float64)
+    for index, template in enumerate(templates):
+        flattened = np.asarray(template).reshape(-1)
+        norm_squared[index] = float(np.real(np.vdot(flattened, flattened)))
+    if not np.all(np.isfinite(norm_squared)) or np.any(norm_squared <= 0):
+        raise ValueError("templates must have positive finite voxel norms")
+
+    normalization = np.asarray(1.0 / np.sqrt(norm_squared), dtype=np.float32)
+    adjusted_eigenvalues = eigenvalues * norm_squared
+    covariance_values = noise_variance + adjusted_eigenvalues
     weights = 1.0 / noise_variance - 1.0 / covariance_values
-    offset = jnp.linalg.slogdet(covariance / noise_variance)[1]
-    score_basis = orthonormal_basis @ covariance_vectors[:, ::-1]
-    kernels = score_basis.T.reshape((-1, *templates.shape[1:]))
+    offset = np.sum(np.log1p(adjusted_eigenvalues / noise_variance))
     return (
-        np.asarray(kernels),
-        np.asarray(weights[::-1], dtype=np.float32),
+        normalization,
+        np.asarray(weights, dtype=np.float32),
         np.float32(offset),
+        adjusted_eigenvalues,
     )
+
+
+def construct_klt_score_filters(
+    templates: npt.ArrayLike,
+    template_eigenvalues: npt.ArrayLike,
+    noise_variance: float,
+) -> tuple[
+    npt.NDArray[np.complex64],
+    npt.NDArray[np.float32],
+    np.float32,
+]:
+    """Materialize normalized score filters for small in-memory problems."""
+    template_array = np.asarray(templates)
+    normalization, weights, offset, _ = orthogonal_klt_score_parameters(
+        template_array,
+        template_eigenvalues,
+        noise_variance,
+    )
+    kernels = np.asarray(
+        template_array * normalization[:, None, None, None],
+        dtype=np.complex64,
+    )
+    return kernels, weights, offset
+
+
+def plan_template_fft_batch(
+    loaded_shape: tuple[int, int, int],
+    core_shape: tuple[int, int, int],
+    template_shape: tuple[int, int, int],
+    templates_per_device: int,
+    device_memory_bytes: int,
+    *,
+    memory_fraction: float = _DEFAULT_SCORE_MEMORY_FRACTION,
+) -> dict[str, int | float]:
+    """Estimate a conservative resident batch for fused complex FFT scoring."""
+    if any(size < 1 for size in loaded_shape + core_shape + template_shape):
+        raise ValueError("scoring shapes must be positive")
+    if templates_per_device < 1:
+        raise ValueError("templates_per_device must be positive")
+    if device_memory_bytes < 1:
+        raise ValueError("device_memory_bytes must be positive")
+    if not 0 < memory_fraction <= 1:
+        raise ValueError("score memory_fraction must lie in (0, 1]")
+
+    real_bytes = np.dtype(np.float32).itemsize
+    complex_bytes = np.dtype(np.complex64).itemsize
+    loaded_voxels = int(np.prod(loaded_shape))
+    output_voxels = int(
+        np.prod(tuple(size + 2 * _LOCAL_MAXIMUM_RADIUS for size in core_shape))
+    )
+    template_voxels = int(np.prod(template_shape))
+    budget_bytes = int(device_memory_bytes * memory_fraction)
+    resident_template_bytes = (
+        templates_per_device * template_voxels * complex_bytes
+    )
+    fixed_bytes = (
+        loaded_voxels
+        * (real_bytes + _SCORE_FIXED_COMPLEX_ARRAYS * complex_bytes)
+        + 2 * output_voxels * real_bytes
+        + resident_template_bytes
+    )
+    bytes_per_batch_template = (
+        loaded_voxels * _SCORE_BATCH_COMPLEX_ARRAYS * complex_bytes
+    )
+    available_bytes = budget_bytes - fixed_bytes
+    batch_size = min(
+        templates_per_device,
+        max(0, available_bytes // bytes_per_batch_template),
+    )
+    if batch_size < 1:
+        raise ValueError(
+            "estimated score memory cannot hold one FFT template batch; "
+            "reduce core_patch_shape or increase score_memory_fraction"
+        )
+    return {
+        "batch_size": int(batch_size),
+        "budget_bytes": budget_bytes,
+        "fixed_bytes": fixed_bytes,
+        "bytes_per_batch_template": bytes_per_batch_template,
+        "estimated_peak_bytes": int(
+            fixed_bytes + batch_size * bytes_per_batch_template
+        ),
+        "memory_fraction": float(memory_fraction),
+    }
 
 
 def compute_klt_score_block(
@@ -183,32 +283,133 @@ def compute_klt_score_block(
     return score - score_offset
 
 
-def score_subvolume_candidates(
+def _centered_filter_spectrum(
+    spatial_filters: jax.Array,
+    fft_shape: tuple[int, int, int],
+) -> jax.Array:
+    """Embed centered filters on an overlap-save grid and transform them."""
+    filters = jnp.asarray(spatial_filters)
+    if filters.ndim == 3:
+        filters = filters[None, ...]
+    filter_shape = filters.shape[-3:]
+    padding = (
+        (0, 0),
+        (0, fft_shape[0] - filter_shape[0]),
+        (0, fft_shape[1] - filter_shape[1]),
+        (0, fft_shape[2] - filter_shape[2]),
+    )
+    padded = jnp.pad(filters, padding)
+    radii = tuple((size - 1) // 2 for size in filter_shape)
+    padded = jnp.roll(
+        padded,
+        shift=tuple(-radius for radius in radii),
+        axis=(-3, -2, -1),
+    )
+    return jnp.fft.fftn(padded, axes=(-3, -2, -1))
+
+
+def compute_fused_klt_score_shard(
     loaded_subvolume: jax.Array,
-    region_start: jax.Array,
     whitening_filter: jax.Array,
-    score_kernels: jax.Array,
-    score_weights: jax.Array,
+    local_templates: jax.Array,
+    local_normalization: jax.Array,
+    local_weights: jax.Array,
     score_offset: jax.Array,
     *,
     core_shape: tuple[int, int, int],
-    source_shape: tuple[int, int, int],
     whitening_radius: int,
+    template_radius: int,
+    score_halo: int,
+    template_batch_size: int,
+    axis_name: str | None,
+) -> jax.Array:
+    """Accumulate one template shard using a shared fused subvolume FFT."""
+    if local_templates.shape[0] % template_batch_size:
+        raise ValueError("local template shard must contain complete batches")
+    fft_shape = tuple(int(size) for size in loaded_subvolume.shape)
+    output_shape = tuple(size + 2 * score_halo for size in core_shape)
+    crop_start = whitening_radius + template_radius
+
+    volume_spectrum = jnp.fft.fftn(loaded_subvolume)
+    whitening_spectrum = _centered_filter_spectrum(
+        whitening_filter,
+        fft_shape,
+    )[0]
+    whitened_spectrum = volume_spectrum * whitening_spectrum
+    initial_score = jnp.zeros(output_shape, dtype=jnp.float32)
+    batch_count = local_templates.shape[0] // template_batch_size
+
+    def accumulate(batch_index: jax.Array, score: jax.Array) -> jax.Array:
+        start = batch_index * template_batch_size
+        templates = jax.lax.dynamic_slice_in_dim(
+            local_templates,
+            start,
+            template_batch_size,
+            axis=0,
+        )
+        normalization = jax.lax.dynamic_slice_in_dim(
+            local_normalization,
+            start,
+            template_batch_size,
+            axis=0,
+        )
+        weights = jax.lax.dynamic_slice_in_dim(
+            local_weights,
+            start,
+            template_batch_size,
+            axis=0,
+        )
+        correlation_filters = jnp.conj(
+            jnp.flip(
+                templates * normalization[:, None, None, None],
+                axis=(-3, -2, -1),
+            )
+        )
+        template_spectra = _centered_filter_spectrum(
+            correlation_filters,
+            fft_shape,
+        )
+        responses = jnp.fft.ifftn(
+            whitened_spectrum[None, ...] * template_spectra,
+            axes=(-3, -2, -1),
+        )
+        owned = jax.lax.dynamic_slice(
+            responses,
+            (0, crop_start, crop_start, crop_start),
+            (template_batch_size, *output_shape),
+        )
+        return score + jnp.sum(
+            weights[:, None, None, None] * jnp.square(jnp.abs(owned)),
+            axis=0,
+        )
+
+    partial_score = jax.lax.fori_loop(
+        0,
+        batch_count,
+        accumulate,
+        initial_score,
+    )
+    score = (
+        partial_score
+        if axis_name is None
+        else jax.lax.psum(partial_score, axis_name)
+    )
+    return score - score_offset
+
+
+def extract_score_candidates(
+    haloed_scores: jax.Array,
+    region_start: jax.Array,
+    *,
+    core_shape: tuple[int, int, int],
+    source_shape: tuple[int, int, int],
     template_radius: int,
     candidate_capacity: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Score one core and return its highest 3x3x3 local maxima."""
+    """Return the ranked 3x3x3 local maxima from one owned score core."""
+    if candidate_capacity > int(np.prod(core_shape)):
+        raise ValueError("candidate_capacity cannot exceed the core voxel count")
     score_halo = _LOCAL_MAXIMUM_RADIUS
-    haloed_scores = compute_klt_score_block(
-        loaded_subvolume,
-        whitening_filter,
-        score_kernels,
-        score_weights,
-        score_offset,
-        core_shape=core_shape,
-        whitening_radius=whitening_radius,
-        score_halo=score_halo,
-    )
     valid_center_mask = jnp.ones(haloed_scores.shape, dtype=bool)
     for axis in range(3):
         global_axis = (
@@ -270,6 +471,99 @@ def score_subvolume_candidates(
         axis=1,
     )
     return coordinates, ranked_scores, candidate_count
+
+
+def score_subvolume_candidates(
+    loaded_subvolume: jax.Array,
+    region_start: jax.Array,
+    whitening_filter: jax.Array,
+    score_kernels: jax.Array,
+    score_weights: jax.Array,
+    score_offset: jax.Array,
+    *,
+    core_shape: tuple[int, int, int],
+    source_shape: tuple[int, int, int],
+    whitening_radius: int,
+    template_radius: int,
+    candidate_capacity: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Score one core and return its highest 3x3x3 local maxima."""
+    score_halo = _LOCAL_MAXIMUM_RADIUS
+    haloed_scores = compute_klt_score_block(
+        loaded_subvolume,
+        whitening_filter,
+        score_kernels,
+        score_weights,
+        score_offset,
+        core_shape=core_shape,
+        whitening_radius=whitening_radius,
+        score_halo=score_halo,
+    )
+    return extract_score_candidates(
+        haloed_scores,
+        region_start,
+        core_shape=core_shape,
+        source_shape=source_shape,
+        template_radius=template_radius,
+        candidate_capacity=candidate_capacity,
+    )
+
+
+def score_template_shards_and_extract_candidates(
+    loaded_subvolume: jax.Array,
+    region_start: jax.Array,
+    whitening_filter: jax.Array,
+    local_templates: jax.Array,
+    local_normalization: jax.Array,
+    local_weights: jax.Array,
+    score_offset: jax.Array,
+    *,
+    core_shape: tuple[int, int, int],
+    source_shape: tuple[int, int, int],
+    whitening_radius: int,
+    template_radius: int,
+    candidate_capacity: int,
+    template_batch_size: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """All-reduce template-sharded scores and extract candidates once."""
+    haloed_scores = compute_fused_klt_score_shard(
+        loaded_subvolume,
+        whitening_filter,
+        local_templates,
+        local_normalization,
+        local_weights,
+        score_offset,
+        core_shape=core_shape,
+        whitening_radius=whitening_radius,
+        template_radius=template_radius,
+        score_halo=_LOCAL_MAXIMUM_RADIUS,
+        template_batch_size=template_batch_size,
+        axis_name=_TEMPLATE_AXIS_NAME,
+    )
+
+    def extract(_: None) -> tuple[jax.Array, jax.Array, jax.Array]:
+        return extract_score_candidates(
+            haloed_scores,
+            region_start,
+            core_shape=core_shape,
+            source_shape=source_shape,
+            template_radius=template_radius,
+            candidate_capacity=candidate_capacity,
+        )
+
+    def empty(_: None) -> tuple[jax.Array, jax.Array, jax.Array]:
+        return (
+            jnp.zeros((candidate_capacity, 3), dtype=jnp.int32),
+            jnp.full((candidate_capacity,), -jnp.inf, dtype=jnp.float32),
+            jnp.asarray(0, dtype=jnp.int32),
+        )
+
+    return jax.lax.cond(
+        jax.lax.axis_index(_TEMPLATE_AXIS_NAME) == 0,
+        extract,
+        empty,
+        operand=None,
+    )
 
 
 def ranked_candidate_nms_3d(
@@ -339,11 +633,15 @@ class MultiGPUKLTParticleDetector3D:
         legendre_order: int = 150,
         threshold: float = 0,
         max_iter: int = 500,
-        max_order: int = 10,
+        max_order: int = 4,
+        template_energy_fraction: float = 0.99,
+        max_templates: int | None = 1000,
         psd_patch_size: int | None = None,
         fredholm_radius: float | None = None,
         template_side: int | None = None,
         nms_radius: float | None = None,
+        score_template_batch_size: int | None = None,
+        score_memory_fraction: float = _DEFAULT_SCORE_MEMORY_FRACTION,
         boundary_mode: PaddingMode = "constant",
     ) -> None:
         """Initialize shared streaming geometry and the KLT template model."""
@@ -356,6 +654,10 @@ class MultiGPUKLTParticleDetector3D:
             raise ValueError("patches_per_microbatch must be positive")
         if candidate_capacity_per_subvolume < 1:
             raise ValueError("candidate capacity must be positive")
+        if score_template_batch_size is not None and score_template_batch_size < 1:
+            raise ValueError("score_template_batch_size must be positive")
+        if not 0 < score_memory_fraction <= 1:
+            raise ValueError("score_memory_fraction must lie in (0, 1]")
 
         patch_size = (
             default_psd_patch_size(particle_diameter, mgscale)
@@ -375,6 +677,8 @@ class MultiGPUKLTParticleDetector3D:
             threshold=threshold,
             max_iter=max_iter,
             max_order=max_order,
+            template_energy_fraction=template_energy_fraction,
+            max_templates=max_templates,
             psd_patch_size=patch_size,
             fredholm_radius=fredholm_radius,
             template_side=template_side,
@@ -385,12 +689,12 @@ class MultiGPUKLTParticleDetector3D:
             + self.model.template_side // 2
             + _LOCAL_MAXIMUM_RADIUS
         )
+        memory_limit = (
+            device_memory_bytes
+            if device_memory_bytes is not None
+            else estimate_device_memory_limit(selected_devices)
+        )
         if core_patch_shape is None:
-            memory_limit = (
-                device_memory_bytes
-                if device_memory_bytes is not None
-                else estimate_device_memory_limit(selected_devices)
-            )
             if memory_limit is None:
                 raise ValueError(
                     "device memory is unavailable; provide core_patch_shape "
@@ -420,6 +724,10 @@ class MultiGPUKLTParticleDetector3D:
         self.patches_per_microbatch = patches_per_microbatch
         self.whitening_support_radius = whitening_support_radius
         self.candidate_capacity_per_subvolume = candidate_capacity_per_subvolume
+        self.device_memory_bytes = memory_limit
+        self.score_template_batch_size = score_template_batch_size
+        self.score_memory_fraction = score_memory_fraction
+        self.score_plan: dict[str, int | float] | None = None
         self.processor = MultiGPUSubvolumeProcessor(
             source,
             domain_shape=source.shape,
@@ -434,6 +742,10 @@ class MultiGPUKLTParticleDetector3D:
         self.whitened_rpsds: RpsdExtractionResult | None = None
         self.whitened_model: CalibratedRpsdModel | None = None
         self.templates: npt.NDArray[np.generic] | None = None
+        self.template_normalization: npt.NDArray[np.float32] | None = None
+        self.score_weights: npt.NDArray[np.float32] | None = None
+        self.score_offset: np.float32 | None = None
+        self.adjusted_template_eigenvalues: npt.NDArray[np.float64] | None = None
         self.candidates: npt.NDArray[np.float64] | None = None
         self.particles: npt.NDArray[np.float64] | None = None
 
@@ -488,23 +800,59 @@ class MultiGPUKLTParticleDetector3D:
         )
         return templates
 
+    def prepare_score_filters(
+        self,
+        templates: npt.ArrayLike,
+        noise_variance: float,
+    ) -> tuple[
+        npt.NDArray[np.float32],
+        npt.NDArray[np.float32],
+        np.float32,
+        npt.NDArray[np.float64],
+    ]:
+        """Prepare direct orthogonal-KLT normalization and likelihood terms."""
+        if self.model.eigvals is None:
+            raise RuntimeError("template eigenvalues have not been initialized")
+        parameters = orthogonal_klt_score_parameters(
+            templates,
+            self.model.eigvals,
+            noise_variance,
+        )
+        (
+            self.template_normalization,
+            self.score_weights,
+            self.score_offset,
+            self.adjusted_template_eigenvalues,
+        ) = parameters
+        return parameters
+
     def score_candidates(
         self,
         templates: npt.ArrayLike,
         noise_variance: float,
         whitening_filter: npt.ArrayLike,
     ) -> npt.NDArray[np.float64]:
-        """Stream fused whitening/scoring and return globally located maxima."""
+        """Template-shard fused FFT scores and return globally located maxima."""
         if self.model.eigvals is None:
             raise RuntimeError("template eigenvalues have not been initialized")
+        templates = np.asanyarray(templates)
+        if templates.ndim != 4 or templates.shape[0] < 1:
+            raise ValueError("templates must have shape (modes, z, y, x)")
         whitening_filter = np.asarray(whitening_filter, dtype=np.float32)
         whitening_radius = spatial_filter_radius(whitening_filter)
-        score_kernels, score_weights, score_offset = construct_klt_score_filters(
-            templates,
-            self.model.eigvals,
-            noise_variance,
-        )
-        template_radius = score_kernels.shape[1] // 2
+        if (
+            self.template_normalization is None
+            or self.score_weights is None
+            or self.score_offset is None
+            or self.adjusted_template_eigenvalues is None
+            or self.template_normalization.shape != (templates.shape[0],)
+        ):
+            self.prepare_score_filters(templates, noise_variance)
+        normalization = self.template_normalization
+        score_weights = self.score_weights
+        score_offset = self.score_offset
+
+        template_radius = templates.shape[1] // 2
         candidate_capacity = min(
             self.candidate_capacity_per_subvolume,
             int(np.prod(self.processor.core_shape)),
@@ -512,56 +860,203 @@ class MultiGPUKLTParticleDetector3D:
         total_halo = (
             whitening_radius + template_radius + _LOCAL_MAXIMUM_RADIUS
         )
-        outputs = self.processor.map(
-            score_subvolume_candidates,
-            whitening_filter,
-            score_kernels,
-            score_weights,
-            score_offset,
-            halo=total_halo,
-            pass_region_starts=True,
-            static_kwargs={
-                "core_shape": self.processor.core_shape,
-                "source_shape": self.source.shape,
-                "whitening_radius": whitening_radius,
-                "template_radius": template_radius,
-                "candidate_capacity": candidate_capacity,
-            },
-            description="KLT scoring",
+        device_count = len(self.devices)
+        templates_per_device = (
+            templates.shape[0] + device_count - 1
+        ) // device_count
+        batch_size = self.score_template_batch_size
+        if batch_size is None:
+            if self.device_memory_bytes is None:
+                batch_size = 1
+                self.score_plan = {
+                    "batch_size": 1,
+                    "memory_fraction": self.score_memory_fraction,
+                }
+            else:
+                self.score_plan = plan_template_fft_batch(
+                    self.processor.loaded_shape(total_halo),
+                    self.processor.core_shape,
+                    tuple(int(size) for size in templates.shape[1:]),
+                    templates_per_device,
+                    self.device_memory_bytes,
+                    memory_fraction=self.score_memory_fraction,
+                )
+                batch_size = int(self.score_plan["batch_size"])
+        batch_size = min(batch_size, templates_per_device)
+        padded_templates_per_device = (
+            (templates_per_device + batch_size - 1) // batch_size * batch_size
+        )
+
+        if self.device_memory_bytes is not None:
+            capacity_plan = plan_template_fft_batch(
+                self.processor.loaded_shape(total_halo),
+                self.processor.core_shape,
+                tuple(int(size) for size in templates.shape[1:]),
+                padded_templates_per_device,
+                self.device_memory_bytes,
+                memory_fraction=self.score_memory_fraction,
+            )
+            if int(capacity_plan["batch_size"]) < batch_size:
+                if self.score_template_batch_size is not None:
+                    raise ValueError(
+                        "configured score_template_batch_size exceeds the "
+                        "estimated device memory capacity"
+                    )
+                batch_size = int(capacity_plan["batch_size"])
+                padded_templates_per_device = (
+                    (templates_per_device + batch_size - 1)
+                    // batch_size
+                    * batch_size
+                )
+                capacity_plan = plan_template_fft_batch(
+                    self.processor.loaded_shape(total_halo),
+                    self.processor.core_shape,
+                    tuple(int(size) for size in templates.shape[1:]),
+                    padded_templates_per_device,
+                    self.device_memory_bytes,
+                    memory_fraction=self.score_memory_fraction,
+                )
+            capacity_plan["batch_size"] = batch_size
+            capacity_plan["templates_per_device"] = padded_templates_per_device
+            capacity_plan["template_count"] = int(templates.shape[0])
+            capacity_plan["batches_per_device"] = (
+                padded_templates_per_device // batch_size
+            )
+            capacity_plan["subvolume_count"] = self.processor.subvolume_count
+            self.score_plan = capacity_plan
+        elif self.score_plan is not None:
+            self.score_plan.update(
+                {
+                    "templates_per_device": padded_templates_per_device,
+                    "template_count": int(templates.shape[0]),
+                    "batches_per_device": padded_templates_per_device // batch_size,
+                    "subvolume_count": self.processor.subvolume_count,
+                }
+            )
+
+        LOGGER.info(
+            "KLT score model: templates=%d | devices=%d | local padded=%d | "
+            "FFT batch=%d | batches/device/subvolume=%d | subvolumes=%d",
+            templates.shape[0],
+            device_count,
+            padded_templates_per_device,
+            batch_size,
+            padded_templates_per_device // batch_size,
+            self.processor.subvolume_count,
+        )
+        if self.score_plan is not None and "estimated_peak_bytes" in self.score_plan:
+            LOGGER.info(
+                "KLT score memory estimate/device: peak=%.2f GiB | "
+                "budget=%.2f GiB | fixed=%.2f GiB",
+                int(self.score_plan["estimated_peak_bytes"]) / 2**30,
+                int(self.score_plan["budget_bytes"]) / 2**30,
+                int(self.score_plan["fixed_bytes"]) / 2**30,
+            )
+
+        template_shards = []
+        normalization_shards = []
+        weight_shards = []
+        for device_index in range(device_count):
+            start = device_index * templates_per_device
+            stop = min(start + templates_per_device, templates.shape[0])
+            count = max(0, stop - start)
+            template_shard = np.zeros(
+                (padded_templates_per_device, *templates.shape[1:]),
+                dtype=np.complex64,
+            )
+            normalization_shard = np.zeros(
+                padded_templates_per_device,
+                dtype=np.float32,
+            )
+            weight_shard = np.zeros(
+                padded_templates_per_device,
+                dtype=np.float32,
+            )
+            if count:
+                template_shard[:count] = np.asarray(
+                    templates[start:stop],
+                    dtype=np.complex64,
+                )
+                normalization_shard[:count] = normalization[start:stop]
+                weight_shard[:count] = score_weights[start:stop]
+            template_shards.append(template_shard)
+            normalization_shards.append(normalization_shard)
+            weight_shards.append(weight_shard)
+
+        LOGGER.info("Transferring compact template shards to devices")
+        device_templates = jax.device_put_sharded(template_shards, self.devices)
+        device_normalization = jax.device_put_sharded(
+            normalization_shards,
+            self.devices,
+        )
+        device_weights = jax.device_put_sharded(weight_shards, self.devices)
+        del template_shards, normalization_shards, weight_shards
+        configured_score = partial(
+            score_template_shards_and_extract_candidates,
+            core_shape=self.processor.core_shape,
+            source_shape=self.source.shape,
+            whitening_radius=whitening_radius,
+            template_radius=template_radius,
+            candidate_capacity=candidate_capacity,
+            template_batch_size=batch_size,
+        )
+        distributed_score = jax.pmap(
+            configured_score,
+            axis_name=_TEMPLATE_AXIS_NAME,
+            in_axes=(None, None, None, 0, 0, 0, None),
+            devices=self.devices,
+        )
+        LOGGER.info(
+            "Scoring kernel will compile on the first of %d subvolumes",
+            self.processor.subvolume_count,
         )
 
         candidate_blocks = []
         valid_lower = np.full(3, template_radius)
         valid_upper = np.asarray(self.source.shape) - template_radius
-        for regions, output in outputs:
-            local_coordinates, local_scores, local_counts = output
-            for slot, region in enumerate(regions):
-                if region is None:
-                    continue
-                candidate_count = int(local_counts[slot])
-                if candidate_count > candidate_capacity:
-                    raise RuntimeError(
-                        "candidate capacity exceeded in subvolume starting at "
-                        f"{region.start}: found {candidate_count}, capacity "
-                        f"{candidate_capacity}; increase "
-                        "candidate_capacity_per_subvolume"
-                    )
-                retained = min(candidate_count, candidate_capacity)
-                coordinates = (
-                    np.asarray(local_coordinates[slot, :retained])
-                    + np.asarray(region.start)
+        for region in tqdm(
+            self.processor.regions(),
+            total=self.processor.subvolume_count,
+            desc="Template-sharded KLT scoring",
+            unit="subvolume",
+        ):
+            loaded_subvolume = self.processor.load_region(region, total_halo)
+            output = distributed_score(
+                loaded_subvolume,
+                np.asarray(region.start, dtype=np.int32),
+                whitening_filter,
+                device_templates,
+                device_normalization,
+                device_weights,
+                score_offset,
+            )
+            local_coordinates, local_scores, local_counts = (
+                np.asarray(output_leaf[0]) for output_leaf in output
+            )
+            candidate_count = int(local_counts)
+            if candidate_count > candidate_capacity:
+                raise RuntimeError(
+                    "candidate capacity exceeded in subvolume starting at "
+                    f"{region.start}: found {candidate_count}, capacity "
+                    f"{candidate_capacity}; increase "
+                    "candidate_capacity_per_subvolume"
                 )
-                scores = np.asarray(local_scores[slot, :retained])
-                inside_source = np.all(
-                    (coordinates >= valid_lower) & (coordinates < valid_upper),
-                    axis=1,
-                )
-                if np.any(inside_source):
-                    candidate_blocks.append(
-                        np.column_stack(
-                            (coordinates[inside_source], scores[inside_source])
-                        )
+            retained = min(candidate_count, candidate_capacity)
+            coordinates = (
+                np.asarray(local_coordinates[:retained])
+                + np.asarray(region.start)
+            )
+            scores = np.asarray(local_scores[:retained])
+            inside_source = np.all(
+                (coordinates >= valid_lower) & (coordinates < valid_upper),
+                axis=1,
+            )
+            if np.any(inside_source):
+                candidate_blocks.append(
+                    np.column_stack(
+                        (coordinates[inside_source], scores[inside_source])
                     )
+                )
         if not candidate_blocks:
             return np.empty((0, 4), dtype=np.float64)
         return np.asarray(np.concatenate(candidate_blocks), dtype=np.float64)

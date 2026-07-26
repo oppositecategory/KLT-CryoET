@@ -266,8 +266,26 @@ class MultiGPUSubvolumeProcessor:
     @property
     def round_count(self) -> int:
         """Return the number of fixed multi-device execution rounds."""
-        region_count = int(np.prod(self.subvolume_grid_shape))
-        return (region_count + len(self.devices) - 1) // len(self.devices)
+        return (self.subvolume_count + len(self.devices) - 1) // len(self.devices)
+
+    @property
+    def subvolume_count(self) -> int:
+        """Return the number of non-overlapping owned core regions."""
+        return int(np.prod(self.subvolume_grid_shape))
+
+    def regions(self) -> Iterator[SpatialRegion]:
+        """Yield the owned core regions in deterministic traversal order."""
+        yield from self._regions()
+
+    def load_region(
+        self,
+        region: SpatialRegion,
+        halo: int = 0,
+    ) -> npt.NDArray[np.generic]:
+        """Load one fixed core plus halo, padding only outside the source."""
+        if halo < 0:
+            raise ValueError("halo must be nonnegative")
+        return self._load_region(region, halo)
 
     def map(
         self,

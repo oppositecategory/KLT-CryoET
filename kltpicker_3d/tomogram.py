@@ -120,6 +120,8 @@ class KLTParticleDetector3D:
         threshold: float = 0,
         max_iter: int = 500,
         max_order: int = 10,
+        template_energy_fraction: float = _TEMPLATE_ENERGY_FRACTION,
+        max_templates: int | None = None,
         psd_patch_size: int | None = None,
         fredholm_radius: float | None = None,
         template_side: int | None = None,
@@ -141,6 +143,10 @@ class KLTParticleDetector3D:
             max_iter: Maximum ALS iterations and legacy maximum unconstrained
                 pick count.
             max_order: Number of spherical-harmonic orders, starting at zero.
+            template_energy_fraction: Fraction of the degeneracy-weighted KLT
+                eigenvalue energy retained when constructing templates.
+            max_templates: Optional upper bound on complete ``(ell, n, m)``
+                templates. Multiplets are never split to reach the bound.
             psd_patch_size: Optional odd PSD patch side, in voxels.
             fredholm_radius: Optional Fredholm support radius, in voxels.
             template_side: Optional odd template side, in voxels.
@@ -173,11 +179,17 @@ class KLTParticleDetector3D:
             raise ValueError("max_iter must be positive")
         if max_order < 1:
             raise ValueError("max_order must be positive")
+        if not 0 < template_energy_fraction <= 1:
+            raise ValueError("template_energy_fraction must lie in (0, 1]")
+        if max_templates is not None and max_templates < 1:
+            raise ValueError("max_templates must be positive when provided")
 
         self.tomogram = tomogram_array
         self.particle_diameter = particle_diameter
         self.mgscale = mgscale
         self.max_order = max_order
+        self.template_energy_fraction = float(template_energy_fraction)
+        self.max_templates = max_templates
         self.bandlimit = np.pi
         self.bandpass_low_fraction = bandpass_low_fraction
         self.bandpass_high_fraction = bandpass_high_fraction
@@ -222,6 +234,11 @@ class KLTParticleDetector3D:
         # them as array geometry rather than as independent model parameters.
         self.template_diameter = self.template_side
         self.template_radius_voxels = self.fredholm_radius_voxels
+        self.available_radial_mode_count: int | None = None
+        self.available_template_count: int | None = None
+        self.retained_radial_mode_count: int | None = None
+        self.retained_template_count: int | None = None
+        self.retained_template_energy_fraction: float | None = None
         self.max_iter = max_iter
 
         spectrum_size = 2 * self.patch_size - 1
@@ -504,10 +521,42 @@ class KLTParticleDetector3D:
         spatial_nodes = (support_radius / 2) * (legendre_nodes + 1)
         frequency_nodes = (bandlimit / 2) * (legendre_nodes + 1)
 
-        truncation_index = radial_mode_truncation_index(
+        multiplicities = 2 * angular_orders + 1
+        mode_energy = eigenvalues * multiplicities
+        total_energy = float(np.sum(mode_energy))
+        self.available_radial_mode_count = int(eigenvalues.size)
+        self.available_template_count = int(np.sum(multiplicities))
+
+        energy_truncation_index = radial_mode_truncation_index(
             eigenvalues,
             angular_orders,
-            energy_fraction=_TEMPLATE_ENERGY_FRACTION,
+            energy_fraction=self.template_energy_fraction,
+        )
+        truncation_index = energy_truncation_index
+        if self.max_templates is not None:
+            complete_template_counts = np.cumsum(multiplicities)
+            cap_truncation_index = int(
+                np.searchsorted(
+                    complete_template_counts,
+                    self.max_templates,
+                    side="right",
+                )
+            )
+            if cap_truncation_index < 1:
+                raise ValueError(
+                    "max_templates is too small to retain the leading "
+                    "spherical-harmonic multiplet"
+                )
+            truncation_index = min(
+                truncation_index,
+                cap_truncation_index,
+            )
+        self.retained_radial_mode_count = truncation_index
+        self.retained_template_count = int(
+            np.sum(multiplicities[:truncation_index])
+        )
+        self.retained_template_energy_fraction = float(
+            np.sum(mode_energy[:truncation_index]) / total_energy
         )
         eigenfunctions = eigenfunctions[:truncation_index]
         eigenvalues = eigenvalues[:truncation_index]
@@ -567,30 +616,61 @@ class KLTParticleDetector3D:
             / eigenvalues[:, None]
         )
 
-        radial_templates = np.zeros(
-            (uniform_eigenfunctions.shape[0], *radius_tensor.shape),
-            dtype=uniform_eigenfunctions.dtype,
+        template_count = int(np.sum(2 * angular_orders + 1))
+        templates = np.empty(
+            (template_count, *radius_tensor.shape),
+            dtype=np.complex64,
         )
-        radial_templates[:, support_mask] = uniform_eigenfunctions[
-            :,
-            inverse_radius_indices,
-        ]
-        (
-            templates,
-            radial_indices,
-            m_values,
-        ) = expand_spherical_harmonic_templates(
-            radial_templates,
-            angular_orders,
-            grid_x,
-            grid_y,
-            grid_z,
-        )
-        template_eigenvalues = eigenvalues[radial_indices]
+        template_eigenvalues = np.empty(template_count, dtype=np.float64)
+        template_orders = np.empty(template_count, dtype=np.int64)
+        template_m_values = np.empty(template_count, dtype=np.int64)
+
+        angular_cache: dict[int, npt.NDArray[np.complex64]] = {}
+        output_start = 0
+        for radial_index, angular_order in enumerate(angular_orders):
+            order = int(angular_order)
+            if order not in angular_cache:
+                angular_modes, _, _ = (
+                    expand_spherical_harmonic_templates(
+                        np.ones((1, *radius_tensor.shape), dtype=np.float32),
+                        np.asarray([order]),
+                        grid_x,
+                        grid_y,
+                        grid_z,
+                    )
+                )
+                angular_cache[order] = np.asarray(
+                    angular_modes,
+                    dtype=np.complex64,
+                )
+            angular_modes = angular_cache[order]
+            multiplicity = angular_modes.shape[0]
+            output_stop = output_start + multiplicity
+            radial_template = np.zeros(radius_tensor.shape, dtype=np.complex64)
+            radial_template[support_mask] = np.asarray(
+                uniform_eigenfunctions[
+                    radial_index,
+                    inverse_radius_indices,
+                ],
+                dtype=np.complex64,
+            )
+            templates[output_start:output_stop] = (
+                angular_modes * radial_template[None, ...]
+            )
+            template_eigenvalues[output_start:output_stop] = eigenvalues[
+                radial_index
+            ]
+            template_orders[output_start:output_stop] = order
+            template_m_values[output_start:output_stop] = np.arange(
+                -order,
+                order + 1,
+                dtype=np.int64,
+            )
+            output_start = output_stop
 
         self.eigvals = template_eigenvalues
-        self.template_orders = angular_orders[radial_indices]
-        self.template_m_values = m_values
+        self.template_orders = template_orders
+        self.template_m_values = template_m_values
         return templates, template_eigenvalues
 
     def create_GPSF_templates(  # noqa: N802

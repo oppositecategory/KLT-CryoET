@@ -1,4 +1,5 @@
 import jax
+import jax.numpy as jnp
 import numpy as np
 from numpy.testing import assert_allclose, assert_array_equal
 from scipy import ndimage
@@ -6,10 +7,72 @@ from scipy.signal import fftconvolve
 
 from kltpicker_3d.multi_gpu import (
     MultiGPUKLTParticleDetector3D,
+    compute_fused_klt_score_shard,
+    compute_klt_score_block,
     construct_klt_score_filters,
+    orthogonal_klt_score_parameters,
+    plan_template_fft_batch,
     ranked_candidate_nms_3d,
 )
 from kltpicker_3d.streaming import ArrayVolumeSource
+
+
+def test_fused_batched_fft_matches_sequential_convolution():
+    rng = np.random.default_rng(44)
+    core_shape = (5, 5, 5)
+    loaded = rng.standard_normal((11, 11, 11)).astype(np.float32)
+    whitening_filter = rng.standard_normal((3, 3, 3)).astype(np.float32)
+    templates = (
+        rng.standard_normal((2, 3, 3, 3))
+        + 1j * rng.standard_normal((2, 3, 3, 3))
+    ).astype(np.complex64)
+    normalization, weights, offset, _ = orthogonal_klt_score_parameters(
+        templates,
+        np.array([2.0, 0.75]),
+        0.8,
+    )
+    normalized_templates = templates * normalization[:, None, None, None]
+
+    sequential = compute_klt_score_block(
+        jnp.asarray(loaded),
+        jnp.asarray(whitening_filter),
+        jnp.asarray(normalized_templates),
+        jnp.asarray(weights),
+        jnp.asarray(offset),
+        core_shape=core_shape,
+        whitening_radius=1,
+        score_halo=1,
+    )
+    fused = compute_fused_klt_score_shard(
+        jnp.asarray(loaded),
+        jnp.asarray(whitening_filter),
+        jnp.asarray(templates),
+        jnp.asarray(normalization),
+        jnp.asarray(weights),
+        jnp.asarray(offset),
+        core_shape=core_shape,
+        whitening_radius=1,
+        template_radius=1,
+        score_halo=1,
+        template_batch_size=2,
+        axis_name=None,
+    )
+
+    assert_allclose(fused, sequential, rtol=1e-5, atol=2e-4)
+
+
+def test_fft_batch_planner_accounts_for_resident_template_shard():
+    plan = plan_template_fft_batch(
+        (32, 32, 32),
+        (24, 24, 24),
+        (9, 9, 9),
+        templates_per_device=10,
+        device_memory_bytes=64 * 2**20,
+        memory_fraction=0.8,
+    )
+
+    assert plan["batch_size"] >= 1
+    assert plan["estimated_peak_bytes"] <= plan["budget_bytes"]
 
 
 def test_global_candidate_nms_is_independent_of_device_completion_order():
