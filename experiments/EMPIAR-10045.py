@@ -1,85 +1,124 @@
-"""Extract patch RPSDs from an EMPIAR-10045 ribosome tomogram."""
+"""Run the complete multi-GPU KLT experiment on EMPIAR-10045 tomogram 08."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import os
 import pickle
+import sys
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, TypeVar
 
 import jax
 import numpy as np
+import numpy.typing as npt
+from scipy.optimize import linear_sum_assignment
+from scipy.spatial.distance import cdist
 
-from kltpicker_3d.streaming import MrcVolumeSource, ShardedRpsdEstimator
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 
-DEFAULT_INPUT = Path(
-    "/luke_leia_data/yoelsh/datasets/10045/pristine/data/ribosomes/"
-    "Tomograms/08/IS002_291013_008.mrc"
+from kltpicker_3d.multi_gpu import MultiGPUKLTParticleDetector3D
+from kltpicker_3d.streaming import MrcVolumeSource
+
+DATASET_ROOT = Path(
+    "/luke_leia_data/yoelsh/datasets/10045/pristine/data/ribosomes"
 )
+DEFAULT_INPUT = DATASET_ROOT / "Tomograms/08/IS002_291013_008.mrc"
+DEFAULT_GROUND_TRUTH = (
+    DATASET_ROOT
+    / "AnticipatedResults/Tomograms/08/IS002_291013_008.coords"
+)
+DEFAULT_RESULTS_DIR = REPOSITORY_ROOT / "results/empiar-10045"
+DEFAULT_INITIAL_RPSDS = REPOSITORY_ROOT / "results/empiar-10045-rpsds.pkl"
 LOGGER = logging.getLogger("empiar-10045")
+T = TypeVar("T")
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse the experiment configuration."""
+    """Parse experiment, checkpointing, and evaluation settings."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=Path("/results/empiar-10045-rpsds.pkl"),
-    )
+    parser.add_argument("--ground-truth", type=Path, default=DEFAULT_GROUND_TRUTH)
+    parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
     parser.add_argument(
         "--log-file",
         type=Path,
-        default=Path("/results/empiar-10045.log"),
+        help="Default: <results-dir>/empiar-10045.log",
     )
     parser.add_argument(
-        "--particle-diameter",
-        type=float,
-        default=270.0,
-        metavar="ANGSTROM",
+        "--initial-rpsds",
+        type=Path,
+        default=DEFAULT_INITIAL_RPSDS,
+        help="Existing first-pass checkpoint; ignored with --recompute-initial.",
     )
+    parser.add_argument("--recompute-initial", action="store_true")
+    parser.add_argument("--particle-diameter", type=float, default=270.0)
     parser.add_argument(
         "--voxel-size",
         type=float,
         metavar="ANGSTROM",
-        help="Override the isotropic voxel size in the MRC header.",
+        help="Override the isotropic MRC voxel size.",
+    )
+    parser.add_argument(
+        "--whitening-support-radius",
+        type=int,
+        default=37,
+        metavar="VOXELS",
+    )
+    parser.add_argument(
+        "--match-radius-angstrom",
+        type=float,
+        help="Recall radius; default: half the particle diameter.",
     )
     parser.add_argument(
         "--core-patch-shape",
         type=int,
         nargs=3,
         metavar=("Z", "Y", "X"),
-        help="Patches per GPU subvolume; default: infer from GPU memory.",
+        help="Patches per GPU core; default: plan for the largest pipeline halo.",
     )
+    parser.add_argument("--memory-fraction", type=float, default=0.3)
+    parser.add_argument("--resident-volume-copies", type=int, default=8)
+    parser.add_argument("--patches-per-microbatch", type=int, default=1)
     parser.add_argument(
-        "--memory-fraction",
-        type=float,
-        default=0.3,
-        help="Fraction of JAX's per-device allocator limit used for planning.",
-    )
-    parser.add_argument(
-        "--patches-per-microbatch",
+        "--candidate-capacity-per-subvolume",
         type=int,
-        default=1,
-        help="Simultaneous patch FFTs per GPU; increase only after a stable run.",
+        default=2_000_000,
+        help="Static local-max output capacity; overflow fails explicitly.",
     )
+    parser.add_argument("--legendre-order", type=int, default=150)
+    parser.add_argument("--max-order", type=int, default=10)
+    parser.add_argument("--max-iterations", type=int, default=500)
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=-np.inf,
+        help="Default disables score filtering so this run measures recall.",
+    )
+    parser.add_argument("--fredholm-radius", type=float)
+    parser.add_argument("--template-side", type=int)
+    parser.add_argument("--nms-radius", type=float)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
         "--allow-cpu",
         action="store_true",
-        help="Allow CPU execution for small debugging runs.",
+        help="Allow CPU only for small debugging inputs.",
     )
     return parser.parse_args()
 
 
 def configure_logging(log_file: Path) -> None:
-    """Log to both stderr and a persistent file."""
+    """Log every pipeline transition to stderr and a persistent file."""
     log_file.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
@@ -94,13 +133,11 @@ def mrc_voxel_size(
     path: Path,
     override: float | None,
 ) -> tuple[float, tuple[float, float, float]]:
-    """Return an isotropic voxel size and the original (z, y, x) spacing."""
+    """Return isotropic spacing and the original ``(z, y, x)`` header values."""
     try:
         import mrcfile
     except ImportError as error:
-        raise RuntimeError(
-            "mrcfile is missing; install the project's declared dependencies"
-        ) from error
+        raise RuntimeError("mrcfile is required for this experiment") from error
 
     with mrcfile.open(path, mode="r", permissive=True, header_only=True) as mrc:
         spacing = (
@@ -112,25 +149,20 @@ def mrc_voxel_size(
         if override <= 0:
             raise ValueError("--voxel-size must be positive")
         return override, spacing
-
     values = np.asarray(spacing)
     if not np.all(np.isfinite(values)) or np.any(values <= 0):
-        raise ValueError(
-            f"invalid MRC voxel spacing {spacing}; pass --voxel-size"
-        )
+        raise ValueError(f"invalid MRC spacing {spacing}; pass --voxel-size")
     if not np.allclose(values, values[0], rtol=1e-4):
-        raise ValueError(
-            f"anisotropic MRC voxel spacing {spacing}; resample the volume first"
-        )
+        raise ValueError(f"anisotropic MRC spacing {spacing}; resample first")
     return float(values.mean()), spacing
 
 
 def local_devices(*, allow_cpu: bool) -> tuple[jax.Device, ...]:
-    """Use every local GPU and reject accidental login-node execution."""
+    """Use all local GPUs and guard against accidental login-node execution."""
     if jax.process_count() != 1:
         raise RuntimeError(
-            "ShardedRpsdEstimator is single-host; expected one JAX process, "
-            f"found {jax.process_count()}"
+            "the multi-GPU processor expects one JAX process; found "
+            f"{jax.process_count()}"
         )
     visible = tuple(jax.local_devices())
     gpus = tuple(device for device in visible if device.platform == "gpu")
@@ -138,14 +170,11 @@ def local_devices(*, allow_cpu: bool) -> tuple[jax.Device, ...]:
         return gpus
     if allow_cpu:
         return visible
-    raise RuntimeError(
-        "JAX sees no GPU. Run on a GPU node, or pass --allow-cpu only for "
-        "a small debugging run."
-    )
+    raise RuntimeError("JAX sees no GPU; use a GPU node or pass --allow-cpu")
 
 
 def memory_limit_gib(device: jax.Device) -> float | None:
-    """Read JAX's per-device allocator limit when the backend exposes it."""
+    """Return the allocator limit when exposed by the backend."""
     try:
         statistics = device.memory_stats()
     except (RuntimeError, NotImplementedError):
@@ -159,134 +188,372 @@ def memory_limit_gib(device: jax.Device) -> float | None:
     return None if limit is None else int(limit) / 2**30
 
 
-def log_plan(
+def load_ground_truth(path: Path) -> np.ndarray:
+    """Load deposited ``(x, y, z)`` coordinates and return ``(z, y, x)``."""
+    coordinates_xyz = np.loadtxt(path, dtype=np.float64, ndmin=2)
+    if coordinates_xyz.ndim != 2 or coordinates_xyz.shape[1] != 3:
+        raise ValueError("ground truth must contain x, y, z columns")
+    if not np.all(np.isfinite(coordinates_xyz)):
+        raise ValueError("ground truth contains non-finite coordinates")
+    return coordinates_xyz[:, ::-1].copy()
+
+
+def _atomic_path(path: Path) -> tuple[Path, Any]:
+    """Create a temporary binary stream beside its final checkpoint path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stream = tempfile.NamedTemporaryFile(
+        mode="w+b",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    return Path(stream.name), stream
+
+
+def save_pickle(value: object, path: Path) -> None:
+    """Atomically save an arbitrary Python checkpoint."""
+    temporary, stream = _atomic_path(path)
+    try:
+        with stream:
+            pickle.dump(value, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def save_npy(value: np.ndarray, path: Path) -> None:
+    """Atomically save a NumPy array without an implicit filename suffix."""
+    temporary, stream = _atomic_path(path)
+    try:
+        with stream:
+            np.save(stream, value, allow_pickle=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def save_npz(path: Path, **arrays: npt.ArrayLike) -> None:
+    """Atomically save named analysis arrays."""
+    temporary, stream = _atomic_path(path)
+    try:
+        with stream:
+            np.savez(stream, **arrays)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def save_json(value: object, path: Path) -> None:
+    """Atomically save human-readable JSON."""
+    temporary, stream = _atomic_path(path)
+    try:
+        with stream:
+            stream.write(
+                json.dumps(value, indent=2, sort_keys=True, allow_nan=False).encode()
+            )
+            stream.write(b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def save_csv(
+    value: np.ndarray,
     path: Path,
-    particle_diameter: float,
+    *,
+    header: str,
+) -> None:
+    """Atomically save a coordinate table."""
+    temporary, stream = _atomic_path(path)
+    try:
+        with stream:
+            np.savetxt(stream, value, delimiter=",", header=header, comments="")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def load_pickle(path: Path) -> Any:
+    """Load a trusted local pipeline checkpoint."""
+    with path.open("rb") as stream:
+        return pickle.load(stream)
+
+
+def run_stage(name: str, function: Callable[[], T]) -> tuple[T, float]:
+    """Run one named stage with visible start, success, and timing logs."""
+    LOGGER.info("=" * 72)
+    LOGGER.info("STAGE START | %s", name)
+    started = time.perf_counter()
+    try:
+        value = function()
+    except Exception:
+        LOGGER.exception("STAGE FAILED | %s", name)
+        raise
+    elapsed = time.perf_counter() - started
+    LOGGER.info("STAGE DONE  | %s | %.2f minutes", name, elapsed / 60)
+    return value, elapsed
+
+
+def record_stage_time(
+    stage_times: dict[str, float],
+    name: str,
+    elapsed: float,
+) -> None:
+    """Retain original timings when a later invocation resumes checkpoints."""
+    if elapsed > 0 or name not in stage_times:
+        stage_times[name] = elapsed
+
+
+def require_replaceable(paths: tuple[Path, ...], *, overwrite: bool) -> None:
+    """Reject accidental replacement of any completed stage artifact."""
+    existing = [path for path in paths if path.exists()]
+    if existing and not overwrite:
+        raise FileExistsError(
+            f"{existing[0]} already exists; pass --resume or --overwrite"
+        )
+
+
+def checkpointed_stage(
+    name: str,
+    path: Path,
+    function: Callable[[], T],
+    *,
+    resume: bool,
+    overwrite: bool,
+) -> tuple[T, float]:
+    """Load a completed stage when resuming, otherwise run and checkpoint it."""
+    if resume and path.is_file():
+        LOGGER.info("STAGE RESUME | %s | loading %s", name, path)
+        return load_pickle(path), 0.0
+    if path.exists() and not overwrite:
+        raise FileExistsError(
+            f"{path} already exists; pass --resume or --overwrite"
+        )
+    value, elapsed = run_stage(name, function)
+    LOGGER.info("Checkpointing %s", path)
+    save_pickle(value, path)
+    return value, elapsed
+
+
+def log_array(name: str, value: npt.ArrayLike) -> None:
+    """Log shape, dtype, range, and finite status for an analysis array."""
+    array = np.asarray(value)
+    finite = np.isfinite(array)
+    if array.size and np.any(finite):
+        minimum = float(np.min(np.real(array[finite])))
+        maximum = float(np.max(np.real(array[finite])))
+        LOGGER.info(
+            "%s | shape=%s dtype=%s finite=%d/%d range=[%.6g, %.6g]",
+            name,
+            array.shape,
+            array.dtype,
+            int(np.sum(finite)),
+            array.size,
+            minimum,
+            maximum,
+        )
+    else:
+        LOGGER.info(
+            "%s | shape=%s dtype=%s | no finite values",
+            name,
+            array.shape,
+            array.dtype,
+        )
+
+
+def validate_initial_rpsds(
+    extraction: object,
+    detector: MultiGPUKLTParticleDetector3D,
+) -> None:
+    """Reject a seed checkpoint that does not match this tomogram geometry."""
+    required = ("rpsds", "variances", "patch_grid_shape", "patch_size")
+    if any(not hasattr(extraction, name) for name in required):
+        raise ValueError("initial RPSD checkpoint has an unsupported format")
+    expected_grid = tuple(
+        size // detector.patch_size for size in detector.source.shape
+    )
+    expected_count = math.prod(expected_grid)
+    if extraction.patch_size != detector.patch_size:
+        raise ValueError(
+            "initial RPSD patch size does not match the current configuration"
+        )
+    if tuple(extraction.patch_grid_shape) != expected_grid:
+        raise ValueError("initial RPSD grid does not match the current tomogram")
+    if extraction.rpsds.shape[0] != expected_count:
+        raise ValueError("initial RPSD sample count does not match its patch grid")
+    if extraction.variances.shape != (expected_count,):
+        raise ValueError("initial RPSD variance count is inconsistent")
+
+
+def evaluate_recall(
+    particles_zyx_score: np.ndarray,
+    truth_zyx: np.ndarray,
+    match_radius_voxels: float,
+) -> tuple[dict[str, Any], np.ndarray]:
+    """Compute maximum-cardinality one-to-one recall within a spatial radius."""
+    predicted = np.asarray(particles_zyx_score, dtype=np.float64)
+    if predicted.ndim != 2 or predicted.shape[1] != 4:
+        raise ValueError("particles must contain z, y, x, score columns")
+    if match_radius_voxels <= 0:
+        raise ValueError("match radius must be positive")
+    if predicted.shape[0] == 0 or truth_zyx.shape[0] == 0:
+        matched = np.empty((0, 9), dtype=np.float64)
+    else:
+        distances = cdist(predicted[:, :3], truth_zyx)
+        within_radius = distances <= match_radius_voxels
+        predicted_indices, truth_indices = linear_sum_assignment(
+            ~within_radius
+        )
+        accepted = within_radius[predicted_indices, truth_indices]
+        predicted_indices = predicted_indices[accepted]
+        truth_indices = truth_indices[accepted]
+        matched = np.column_stack(
+            (
+                predicted_indices,
+                truth_indices,
+                predicted[predicted_indices, :3],
+                truth_zyx[truth_indices],
+                distances[predicted_indices, truth_indices],
+            )
+        )
+    matched_count = matched.shape[0]
+    summary = {
+        "ground_truth_count": int(truth_zyx.shape[0]),
+        "requested_pick_count": int(truth_zyx.shape[0]),
+        "returned_pick_count": int(predicted.shape[0]),
+        "matched_ground_truth_count": int(matched_count),
+        "recall": float(matched_count / truth_zyx.shape[0]),
+        "match_radius_voxels": float(match_radius_voxels),
+        "mean_matched_distance_voxels": (
+            None if not matched_count else float(np.mean(matched[:, -1]))
+        ),
+        "median_matched_distance_voxels": (
+            None if not matched_count else float(np.median(matched[:, -1]))
+        ),
+    }
+    return summary, matched
+
+
+def log_plan(
+    args: argparse.Namespace,
+    detector: MultiGPUKLTParticleDetector3D,
     voxel_size: float,
     header_spacing: tuple[float, float, float],
-    estimator: ShardedRpsdEstimator,
+    truth_count: int,
 ) -> None:
-    """Log the resolved geometry before the expensive first compilation."""
-    config = estimator.config
-    grid = estimator.patch_grid_shape
-    patch_count = math.prod(grid)
-    used_shape = tuple(count * config.patch_size for count in grid)
-    cropped = tuple(
-        size - used
-        for size, used in zip(estimator.source.shape, used_shape, strict=True)
+    """Log the complete resolved geometry before expensive compilation."""
+    processor = detector.processor
+    patch_grid = tuple(size // detector.patch_size for size in detector.source.shape)
+    core_patch_shape = tuple(
+        size // detector.patch_size for size in processor.core_shape
     )
-    result_mib = (
-        patch_count
-        * (estimator.uniform_points.size + 1)
-        * np.dtype(np.float32).itemsize
-        + estimator.uniform_points.nbytes
-    ) / 2**20
-
+    whitening_halo = detector.whitening_support_radius
+    template_radius = detector.model.template_side // 2
+    scoring_halo = whitening_halo + template_radius + 1
+    LOGGER.info("Input: %s | %.2f GiB", args.input, args.input.stat().st_size / 2**30)
     LOGGER.info(
-        "Input: %s | %.2f GiB | shape(z,y,x)=%s",
-        path,
-        path.stat().st_size / 2**30,
-        estimator.source.shape,
-    )
-    LOGGER.info(
-        "Particle: %.1f A | voxel: %.7f A (header z,y,x=%s)",
-        particle_diameter,
+        "Volume: shape(z,y,x)=%s | voxel=%.7f A | header=%s",
+        detector.source.shape,
         voxel_size,
         tuple(round(value, 7) for value in header_spacing),
     )
     LOGGER.info(
-        "Patch: %d^3 voxels (%.1f A) | grid=%s | patches=%d",
-        config.patch_size,
-        config.patch_size * voxel_size,
-        grid,
-        patch_count,
+        "Truth: %s | particles=%d | NMS requested picks=%d",
+        args.ground_truth,
+        truth_count,
+        detector.model.num_particles,
     )
     LOGGER.info(
-        "RPSD: max ACF distance=%d voxels | radial bins=%d",
-        max(
-            1,
-            math.floor(
-                config.max_acf_distance_fraction * config.patch_size
-            ),
-        ),
-        estimator.uniform_points.size,
+        "RPSD: patch=%d^3 | grid=%s | total patches=%d | microbatch=%d",
+        detector.patch_size,
+        patch_grid,
+        math.prod(patch_grid),
+        detector.patches_per_microbatch,
     )
     LOGGER.info(
-        "FFT workload per GPU: batch=%d | padded shape=%s",
-        config.patches_per_microbatch,
-        (2 * config.patch_size - 1,) * 3,
-    )
-    if any(cropped):
-        LOGGER.warning("Trailing cropped voxels (z,y,x): %s", cropped)
-    LOGGER.info(
-        "Per GPU: core patches=%s | loaded voxels=%s | microbatch=%d",
-        config.core_patch_shape,
-        config.loaded_shape,
-        config.patches_per_microbatch,
+        "KLT: Legendre=%d | angular orders=%d | template=%d^3",
+        detector.model.legendre_order,
+        detector.model.max_order,
+        detector.model.template_side,
     )
     LOGGER.info(
-        "Schedule: subvolume grid=%s | rounds=%d | host buffer=%.2f GiB",
-        estimator.subvolume_grid_shape,
-        estimator.round_count,
-        estimator.host_buffer_bytes / 2**30,
+        "Halos: whitening=%d | template=%d | local-max=1 | scoring total=%d",
+        whitening_halo,
+        template_radius,
+        scoring_halo,
     )
     LOGGER.info(
-        "Expected result: RPSDs=(%d, %d), variances=(%d,) | %.1f MiB",
-        patch_count,
-        estimator.uniform_points.size,
-        patch_count,
-        result_mib,
+        "Per GPU: core patches=%s | core voxels=%s | scoring load=%s",
+        core_patch_shape,
+        processor.core_shape,
+        processor.loaded_shape(scoring_halo),
     )
-
-
-def save_result(result: object, output: Path, *, overwrite: bool) -> None:
-    """Atomically publish the result so a failed write is never mistaken as valid."""
-    if output.exists() and not overwrite:
-        raise FileExistsError(
-            f"{output} already exists; pass --overwrite to replace it"
-        )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=output.parent,
-            prefix=f".{output.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as stream:
-            temporary = Path(stream.name)
-            pickle.dump(result, stream, protocol=pickle.HIGHEST_PROTOCOL)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, output)
-    finally:
-        if temporary is not None and temporary.exists():
-            temporary.unlink()
+    LOGGER.info(
+        "Schedule: subvolume grid=%s | rounds=%d | scoring host buffer=%.2f GiB",
+        processor.subvolume_grid_shape,
+        processor.round_count,
+        processor.host_buffer_bytes(scoring_halo) / 2**30,
+    )
+    LOGGER.info(
+        "Candidates: static capacity/subvolume=%d | threshold=%s | NMS radius=%.2f",
+        detector.candidate_capacity_per_subvolume,
+        detector.model.threshold,
+        detector.model.nms_radius_voxels,
+    )
 
 
 def main() -> None:
-    """Validate configuration, run extraction, and save the host result."""
+    """Run the complete checkpointed experiment and report recall."""
     args = parse_args()
-    configure_logging(args.log_file)
+    args.results_dir = args.results_dir.resolve()
+    log_file = (
+        args.results_dir / "empiar-10045.log"
+        if args.log_file is None
+        else args.log_file.resolve()
+    )
+    configure_logging(log_file)
     started = time.perf_counter()
+    stage_times: dict[str, float] = {}
 
     try:
         if not args.input.is_file():
             raise FileNotFoundError(args.input)
-        if args.input.resolve() == args.output.resolve():
-            raise ValueError("input and output paths must differ")
-        if args.log_file.resolve() == args.output.resolve():
-            raise ValueError("log and output paths must differ")
-        if args.output.exists() and not args.overwrite and not args.dry_run:
-            raise FileExistsError(
-                f"{args.output} already exists; pass --overwrite to replace it"
-            )
+        if not args.ground_truth.is_file():
+            raise FileNotFoundError(args.ground_truth)
+        args.results_dir.mkdir(parents=True, exist_ok=True)
+        previous_evaluation = args.results_dir / "09_evaluation.json"
+        if args.resume and previous_evaluation.is_file():
+            with previous_evaluation.open() as stream:
+                previous = json.load(stream)
+            stage_times.update(previous.get("stage_runtime_seconds", {}))
 
-        voxel_size, header_spacing = mrc_voxel_size(
-            args.input,
-            args.voxel_size,
+        voxel_size, header_spacing = mrc_voxel_size(args.input, args.voxel_size)
+        truth_zyx = load_ground_truth(args.ground_truth)
+        truth_count = truth_zyx.shape[0]
+        match_radius_angstrom = (
+            args.particle_diameter / 2
+            if args.match_radius_angstrom is None
+            else args.match_radius_angstrom
         )
+        if match_radius_angstrom <= 0:
+            raise ValueError("--match-radius-angstrom must be positive")
+        match_radius_voxels = match_radius_angstrom / voxel_size
 
         devices = local_devices(allow_cpu=args.allow_cpu)
         LOGGER.info(
@@ -305,10 +572,12 @@ def main() -> None:
             )
 
         with MrcVolumeSource(args.input) as source:
-            estimator = ShardedRpsdEstimator.from_particle_geometry(
+            detector = MultiGPUKLTParticleDetector3D(
                 source,
                 particle_diameter=args.particle_diameter,
                 mgscale=1.0 / voxel_size,
+                num_particles=truth_count,
+                whitening_support_radius=args.whitening_support_radius,
                 devices=devices,
                 core_patch_shape=(
                     None
@@ -316,37 +585,330 @@ def main() -> None:
                     else tuple(args.core_patch_shape)
                 ),
                 memory_fraction=args.memory_fraction,
+                resident_volume_copies=args.resident_volume_copies,
                 patches_per_microbatch=args.patches_per_microbatch,
+                candidate_capacity_per_subvolume=(
+                    args.candidate_capacity_per_subvolume
+                ),
+                legendre_order=args.legendre_order,
+                threshold=args.threshold,
+                max_iter=args.max_iterations,
+                max_order=args.max_order,
+                fredholm_radius=args.fredholm_radius,
+                template_side=args.template_side,
+                nms_radius=args.nms_radius,
             )
-            log_plan(
-                args.input,
-                args.particle_diameter,
-                voxel_size,
-                header_spacing,
-                estimator,
+            log_plan(args, detector, voxel_size, header_spacing, truth_count)
+            LOGGER.info(
+                "Recall matching radius: %.2f A = %.2f voxels",
+                match_radius_angstrom,
+                match_radius_voxels,
+            )
+
+            manifest = {
+                "input": str(args.input.resolve()),
+                "ground_truth": str(args.ground_truth.resolve()),
+                "volume_shape_zyx": source.shape,
+                "voxel_size_angstrom": voxel_size,
+                "particle_diameter_angstrom": args.particle_diameter,
+                "truth_count": truth_count,
+                "patch_size": detector.patch_size,
+                "core_shape": detector.processor.core_shape,
+                "devices": [device.device_kind for device in devices],
+                "whitening_support_radius": args.whitening_support_radius,
+                "template_side": detector.model.template_side,
+                "nms_radius_voxels": detector.model.nms_radius_voxels,
+                "match_radius_angstrom": match_radius_angstrom,
+                "match_radius_voxels": match_radius_voxels,
+            }
+            save_json(manifest, args.results_dir / "00_manifest.json")
+            save_npy(truth_zyx, args.results_dir / "00_ground_truth_zyx.npy")
+            save_csv(
+                truth_zyx[:, ::-1],
+                args.results_dir / "00_ground_truth_xyz.csv",
+                header="x,y,z",
             )
             if args.dry_run:
-                LOGGER.info("Dry run complete; extraction was not started.")
+                LOGGER.info("Dry run complete; no numerical stage was started.")
                 return
 
-            LOGGER.info("Starting sharded RPSD extraction")
-            extraction_started = time.perf_counter()
-            result = estimator.extract()
+            initial_path = args.results_dir / "01_initial_patch_rpsds.pkl"
+            if args.resume and initial_path.is_file():
+                LOGGER.info(
+                    "STAGE RESUME | initial RPSDs | loading %s",
+                    initial_path,
+                )
+                detector.initial_rpsds = load_pickle(initial_path)
+                record_stage_time(stage_times, "initial_rpsds", 0.0)
+            elif (
+                not args.recompute_initial
+                and args.initial_rpsds.is_file()
+            ):
+                if initial_path.exists() and not args.overwrite:
+                    raise FileExistsError(
+                        f"{initial_path} exists; pass --resume or --overwrite"
+                    )
+                LOGGER.info(
+                    "STAGE SEED | initial RPSDs | loading existing %s",
+                    args.initial_rpsds,
+                )
+                detector.initial_rpsds = load_pickle(args.initial_rpsds)
+                save_pickle(detector.initial_rpsds, initial_path)
+                record_stage_time(stage_times, "initial_rpsds", 0.0)
+            else:
+                detector.initial_rpsds, elapsed = checkpointed_stage(
+                    "1/8 initial streamed patch RPSDs",
+                    initial_path,
+                    detector.estimate_rpsds,
+                    resume=args.resume,
+                    overwrite=args.overwrite,
+                )
+                record_stage_time(stage_times, "initial_rpsds", elapsed)
+            validate_initial_rpsds(detector.initial_rpsds, detector)
+            log_array("Initial patch RPSDs", detector.initial_rpsds.rpsds)
+            log_array("Initial patch variances", detector.initial_rpsds.variances)
+
+            detector.initial_model, elapsed = checkpointed_stage(
+                "2/8 initial ALS and variance calibration",
+                args.results_dir / "02_initial_als.pkl",
+                lambda: detector.fit_rpsds(detector.initial_rpsds),
+                resume=args.resume,
+                overwrite=args.overwrite,
+            )
+            record_stage_time(stage_times, "initial_als", elapsed)
             LOGGER.info(
-                "Extraction completed in %.1f minutes",
-                (time.perf_counter() - extraction_started) / 60,
+                "Initial ALS: noise variance=%.8g",
+                detector.initial_model.noise_variance,
+            )
+            log_array("Initial particle PSD", detector.initial_model.particle_psd)
+            log_array("Initial noise PSD", detector.initial_model.noise_psd)
+
+            detector.whitening_filter, elapsed = checkpointed_stage(
+                "3/8 finite whitening filter construction",
+                args.results_dir / "03_whitening_filter.pkl",
+                lambda: detector.build_whitening_filter(
+                    detector.initial_model.noise_psd
+                ),
+                resume=args.resume,
+                overwrite=args.overwrite,
+            )
+            record_stage_time(stage_times, "whitening_filter", elapsed)
+            save_npy(
+                detector.whitening_filter,
+                args.results_dir / "03_whitening_filter.npy",
+            )
+            log_array("Whitening filter", detector.whitening_filter)
+            LOGGER.info(
+                "Whitening filter L2 norm=%.8g",
+                np.linalg.norm(detector.whitening_filter),
             )
 
-        LOGGER.info("Writing %s", args.output)
-        save_result(result, args.output, overwrite=args.overwrite)
+            detector.whitened_rpsds, elapsed = checkpointed_stage(
+                "4/8 whitened streamed patch RPSDs",
+                args.results_dir / "04_whitened_patch_rpsds.pkl",
+                lambda: detector.estimate_rpsds(detector.whitening_filter),
+                resume=args.resume,
+                overwrite=args.overwrite,
+            )
+            record_stage_time(stage_times, "whitened_rpsds", elapsed)
+            log_array("Whitened patch RPSDs", detector.whitened_rpsds.rpsds)
+            log_array(
+                "Whitened patch variances",
+                detector.whitened_rpsds.variances,
+            )
+
+            detector.whitened_model, elapsed = checkpointed_stage(
+                "5/8 whitened ALS and variance calibration",
+                args.results_dir / "05_whitened_als.pkl",
+                lambda: detector.fit_rpsds(detector.whitened_rpsds),
+                resume=args.resume,
+                overwrite=args.overwrite,
+            )
+            record_stage_time(stage_times, "whitened_als", elapsed)
+            LOGGER.info(
+                "Whitened ALS: noise variance=%.8g",
+                detector.whitened_model.noise_variance,
+            )
+            log_array(
+                "Whitened particle PSD",
+                detector.whitened_model.particle_psd,
+            )
+            log_array("Whitened noise PSD", detector.whitened_model.noise_psd)
+
+            templates_path = args.results_dir / "06_templates.npy"
+            template_metadata_path = (
+                args.results_dir / "06_template_metadata.npz"
+            )
+            if (
+                args.resume
+                and templates_path.is_file()
+                and template_metadata_path.is_file()
+            ):
+                LOGGER.info(
+                    "STAGE RESUME | templates | loading %s",
+                    templates_path,
+                )
+                detector.templates = np.load(
+                    templates_path,
+                    mmap_mode="r",
+                    allow_pickle=False,
+                )
+                elapsed = 0.0
+            else:
+                require_replaceable(
+                    (templates_path, template_metadata_path),
+                    overwrite=args.overwrite,
+                )
+                detector.templates, elapsed = run_stage(
+                    "6/8 Fredholm solve and KLT template construction",
+                    lambda: detector.build_templates(
+                        detector.whitened_model.particle_psd
+                    ),
+                )
+                save_npy(detector.templates, templates_path)
+                save_npz(
+                    template_metadata_path,
+                    template_eigenvalues=detector.model.eigvals,
+                    radial_eigenvalues=detector.model.radial_eigvals,
+                    radial_eigenfunctions=detector.model.eigfuncs,
+                    template_orders=detector.model.template_orders,
+                    template_m_values=detector.model.template_m_values,
+                )
+            record_stage_time(stage_times, "templates", elapsed)
+            with np.load(template_metadata_path, allow_pickle=False) as metadata:
+                detector.model.eigvals = metadata[
+                    "template_eigenvalues"
+                ].copy()
+                detector.model.radial_eigvals = metadata[
+                    "radial_eigenvalues"
+                ].copy()
+                detector.model.eigfuncs = metadata[
+                    "radial_eigenfunctions"
+                ].copy()
+                detector.model.template_orders = metadata[
+                    "template_orders"
+                ].copy()
+                detector.model.template_m_values = metadata[
+                    "template_m_values"
+                ].copy()
+            log_array("KLT templates", detector.templates)
+            log_array("Template eigenvalues", detector.model.eigvals)
+            LOGGER.info(
+                "Templates: modes=%d | spatial shape=%s",
+                detector.templates.shape[0],
+                detector.templates.shape[1:],
+            )
+
+            candidates_path = args.results_dir / "07_candidates.npy"
+            if args.resume and candidates_path.is_file():
+                LOGGER.info(
+                    "STAGE RESUME | scoring candidates | loading %s",
+                    candidates_path,
+                )
+                detector.candidates = np.load(candidates_path, allow_pickle=False)
+                elapsed = 0.0
+            else:
+                require_replaceable(
+                    (candidates_path,),
+                    overwrite=args.overwrite,
+                )
+                detector.candidates, elapsed = run_stage(
+                    "7/8 fused whitening, KLT scoring, and local maxima",
+                    lambda: detector.score_candidates(
+                        detector.templates,
+                        detector.whitened_model.noise_variance,
+                        detector.whitening_filter,
+                    ),
+                )
+                save_npy(detector.candidates, candidates_path)
+            record_stage_time(stage_times, "scoring", elapsed)
+            LOGGER.info(
+                "Candidates returned from all GPUs: %d",
+                len(detector.candidates),
+            )
+            if len(detector.candidates):
+                log_array("Candidate raw scores", detector.candidates[:, 3])
+
+            particles_path = args.results_dir / "08_particles_zyx.npy"
+            if args.resume and particles_path.is_file():
+                LOGGER.info(
+                    "STAGE RESUME | global NMS | loading %s",
+                    particles_path,
+                )
+                detector.particles = np.load(particles_path, allow_pickle=False)
+                elapsed = 0.0
+            else:
+                require_replaceable(
+                    (particles_path,),
+                    overwrite=args.overwrite,
+                )
+                detector.particles, elapsed = run_stage(
+                    "8/8 global ranking and NMS",
+                    lambda: detector.non_maximum_suppression(
+                        detector.candidates
+                    ),
+                )
+                save_npy(detector.particles, particles_path)
+            record_stage_time(stage_times, "global_nms", elapsed)
+            particles_xyz_score = detector.particles[:, [2, 1, 0, 3]]
+            save_csv(
+                particles_xyz_score,
+                args.results_dir / "08_particles_xyz.csv",
+                header="x,y,z,normalized_score",
+            )
+            LOGGER.info(
+                "NMS returned %d coordinates (requested %d)",
+                len(detector.particles),
+                truth_count,
+            )
+
+        evaluation, matches = evaluate_recall(
+            detector.particles,
+            truth_zyx,
+            match_radius_voxels,
+        )
+        evaluation["match_radius_angstrom"] = float(match_radius_angstrom)
+        evaluation["total_runtime_minutes"] = (
+            time.perf_counter() - started
+        ) / 60
+        evaluation["stage_runtime_seconds"] = stage_times
+        save_json(evaluation, args.results_dir / "09_evaluation.json")
+        save_csv(
+            matches,
+            args.results_dir / "09_matches.csv",
+            header=(
+                "prediction_index,truth_index,pred_z,pred_y,pred_x,"
+                "truth_z,truth_y,truth_x,distance_voxels"
+            ),
+        )
+        save_pickle(
+            {
+                "particles_zyx_score": detector.particles,
+                "ground_truth_zyx": truth_zyx,
+                "matches": matches,
+                "evaluation": evaluation,
+            },
+            args.results_dir / "09_final_result.pkl",
+        )
+        LOGGER.info("=" * 72)
         LOGGER.info(
-            "Done in %.1f minutes | output size=%.2f MiB",
-            (time.perf_counter() - started) / 60,
-            args.output.stat().st_size / 2**20,
+            "FINAL RECALL | matched=%d / truth=%d | recall=%.4f",
+            evaluation["matched_ground_truth_count"],
+            evaluation["ground_truth_count"],
+            evaluation["recall"],
+        )
+        LOGGER.info(
+            "Coordinates: %s",
+            args.results_dir / "08_particles_xyz.csv",
+        )
+        LOGGER.info(
+            "Experiment completed in %.2f minutes | results=%s",
+            evaluation["total_runtime_minutes"],
+            args.results_dir,
         )
     except Exception:
         LOGGER.exception(
-            "Experiment failed after %.1f minutes",
+            "Experiment failed after %.2f minutes",
             (time.perf_counter() - started) / 60,
         )
         raise

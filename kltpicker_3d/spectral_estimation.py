@@ -1,5 +1,7 @@
 """Isotropic autocorrelation and power-spectrum estimation in three dimensions."""
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 
 import jax

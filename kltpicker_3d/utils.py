@@ -1,5 +1,7 @@
 """Numerical utilities for 3D KLT spectral estimation and detection."""
 
+from __future__ import annotations
+
 import jax
 import jax.numpy as jnp
 import numpy as np

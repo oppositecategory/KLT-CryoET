@@ -1,5 +1,7 @@
 """End-to-end three-dimensional KLT particle detection."""
 
+from __future__ import annotations
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -110,7 +112,7 @@ class KLTParticleDetector3D:
 
     def __init__(
         self,
-        tomogram: jax.Array | npt.ArrayLike,
+        tomogram: jax.Array | npt.ArrayLike | None,
         particle_diameter: float,
         mgscale: float,
         num_particles: int,
@@ -128,7 +130,8 @@ class KLTParticleDetector3D:
         """Initialize detector geometry and numerical settings.
 
         Args:
-            tomogram: Input volume in ``(z, y, x)`` order.
+            tomogram: Optional input volume in ``(z, y, x)`` order. ``None``
+                initializes only the reusable KLT geometry and template model.
             particle_diameter: Particle diameter in input physical units.
             mgscale: Voxels per input physical unit.
             num_particles: Maximum requested picks, or ``-1`` to use only the
@@ -150,12 +153,14 @@ class KLTParticleDetector3D:
             ValueError: If the volume, geometry, or numerical settings are
                 invalid.
         """
-        tomogram_array = jnp.asarray(
-            tomogram,
-            dtype=jnp.result_type(tomogram, jnp.float32),
-        )
-        if tomogram_array.ndim != 3:
-            raise ValueError("tomogram must be three-dimensional")
+        tomogram_array = None
+        if tomogram is not None:
+            tomogram_array = jnp.asarray(
+                tomogram,
+                dtype=jnp.result_type(tomogram, jnp.float32),
+            )
+            if tomogram_array.ndim != 3:
+                raise ValueError("tomogram must be three-dimensional")
         if particle_diameter <= 0:
             raise ValueError("particle_diameter must be positive")
         if mgscale <= 0:
@@ -252,6 +257,8 @@ class KLTParticleDetector3D:
         self,
     ) -> tuple[int, npt.NDArray[np.float64]]:
         """Run preprocessing, spectral estimation, templating, and picking."""
+        if self.tomogram is None:
+            raise RuntimeError("process_tomogram requires a resident tomogram")
         self.preprocessed_tomogram = bandpass_filter_3d(
             self.tomogram,
             low_fraction=self.bandpass_low_fraction,
@@ -386,6 +393,8 @@ class KLTParticleDetector3D:
             spatial noise-variance estimate.
         """
         source = self.tomogram if tomogram is None else tomogram
+        if source is None:
+            raise RuntimeError("factorize_rpsd requires a resident tomogram")
         max_distance = int(np.floor(_PSD_ACF_DISTANCE_FRACTION * self.patch_size))
         patches = _extract_nonoverlapping_patches(
             source,
@@ -631,7 +640,10 @@ class KLTParticleDetector3D:
                 "template eigenvalues must be initialized before detection"
             )
 
-        source = jnp.asarray(self.tomogram if tomogram is None else tomogram)
+        source_volume = self.tomogram if tomogram is None else tomogram
+        if source_volume is None:
+            raise RuntimeError("detect_particles requires a resident tomogram")
+        source = jnp.asarray(source_volume)
         template_array = jnp.asarray(templates)
         if template_array.ndim != 4:
             raise ValueError("templates must have shape (num_templates, z, y, x)")
