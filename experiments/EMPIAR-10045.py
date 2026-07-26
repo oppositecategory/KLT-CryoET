@@ -30,12 +30,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("empiar-10045-rpsds.pkl"),
+        default=Path("/results/empiar-10045-rpsds.pkl"),
     )
     parser.add_argument(
         "--log-file",
         type=Path,
-        default=Path("empiar-10045.log"),
+        default=Path("/results/empiar-10045.log"),
     )
     parser.add_argument(
         "--particle-diameter",
