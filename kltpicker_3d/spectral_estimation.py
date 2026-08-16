@@ -1,9 +1,12 @@
 """Isotropic autocorrelation and power-spectrum estimation in three dimensions."""
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import numpy.typing as npt
 from skimage.filters import window
 
@@ -91,16 +94,32 @@ def estimate_isotropic_autocorrelation(
     if not 0 <= max_d < size:
         raise ValueError("max_d must lie in [0, patch_size)")
 
-    positive_lags = jnp.arange(max_d + 1)
-    lag_z, lag_y, lag_x = jnp.meshgrid(
+    # Lag geometry depends only on the static patch shape and max_d. Building
+    # it with NumPy keeps the resulting index-array sizes static under jit,
+    # vmap, and scan; data-dependent jnp.where/jnp.unique sizes cannot be
+    # staged by JAX.
+    positive_lags = np.arange(max_d + 1)
+    lag_z_numpy, lag_y_numpy, lag_x_numpy = np.meshgrid(
         positive_lags,
         positive_lags,
         positive_lags,
         indexing="ij",
     )
-    squared_radius = lag_z**2 + lag_y**2 + lag_x**2
-    valid_lags = jnp.where(squared_radius <= max_d**2)
-    squared_distances = jnp.unique(squared_radius[valid_lags])
+    squared_radius_numpy = (
+        lag_z_numpy**2 + lag_y_numpy**2 + lag_x_numpy**2
+    )
+    valid_lags_numpy = np.where(squared_radius_numpy <= max_d**2)
+    valid_lags = tuple(
+        jnp.asarray(indices)
+        for indices in valid_lags_numpy
+    )
+    squared_distances = jnp.asarray(
+        np.unique(squared_radius_numpy[valid_lags_numpy])
+    )
+    lag_z = jnp.asarray(lag_z_numpy)
+    lag_y = jnp.asarray(lag_y_numpy)
+    lag_x = jnp.asarray(lag_x_numpy)
+    squared_radius = jnp.asarray(squared_radius_numpy)
 
     radial_indices = jnp.searchsorted(
         squared_distances,

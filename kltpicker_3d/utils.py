@@ -1,5 +1,7 @@
 """Numerical utilities for 3D KLT spectral estimation and detection."""
 
+from __future__ import annotations
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -149,9 +151,11 @@ def radial_average_jax(
     ids = jnp.asarray(shell_ids).ravel()
     shell_counts = jnp.asarray(counts)
     mask = ids >= 0
+    safe_ids = jnp.where(mask, ids, 0)
+    masked_values = jnp.where(mask, values, 0)
     sums = jnp.bincount(
-        ids[mask],
-        weights=values[mask],
+        safe_ids,
+        weights=masked_values,
         length=nbins,
     )
     return jnp.where(
@@ -318,6 +322,273 @@ def calibrate_radial_psds(
     signal_variance = max(mean_patch_variance - noise_variance, 0.0)
     calibrated_particle = particle_psd * signal_variance / particle_shape_variance
     return calibrated_particle, calibrated_noise
+
+
+def construct_finite_whitening_filter(
+    radial_points: npt.ArrayLike,
+    noise_psd: npt.ArrayLike,
+    patch_size: int,
+    support_radius: int,
+    *,
+    regularization_fraction: float = 0.1,
+    taper_fraction: float = 0.2,
+    bandpass_low_fraction: float = 0.0,
+    bandpass_high_fraction: float = 0.0,
+) -> npt.NDArray[np.float64]:
+    """Construct a finite spatial approximation to a radial whitening filter.
+
+    The radial response is interpolated onto a centered cubic frequency grid
+    with side ``2 * patch_size - 1``. Its regularized inverse square root is
+    transformed to the spatial domain, projected to inversion symmetry, and
+    cropped to the spherical support ``support_radius``. A cosine taper over
+    the outer ``taper_fraction`` of the support reduces ringing from a hard
+    cutoff.
+
+    Args:
+        radial_points: Strictly increasing radial frequencies in radians per
+            voxel.
+        noise_psd: Noise PSD sampled at ``radial_points``.
+        patch_size: Side length of the patches used to estimate the RPSD.
+        support_radius: Required finite spatial support, in voxels. This is
+            also the halo required for streamed linear convolution.
+        regularization_fraction: Fraction of the median noise PSD added before
+            inversion.
+        taper_fraction: Fraction of the support radius occupied by the outer
+            cosine transition. Zero requests a hard spherical cutoff.
+
+    Returns:
+        Real, inversion-symmetric filter with shape
+        ``(2 * support_radius + 1,) * 3`` and exact zero values outside the
+        requested spherical support.
+
+    Raises:
+        ValueError: If the spectral samples or construction parameters are
+            invalid.
+    """
+    radial_points = np.asarray(radial_points, dtype=np.float64)
+    noise_psd = np.asarray(noise_psd, dtype=np.float64)
+    if radial_points.ndim != 1 or noise_psd.ndim != 1:
+        raise ValueError("radial_points and noise_psd must be one-dimensional")
+    if radial_points.shape != noise_psd.shape:
+        raise ValueError("radial_points and noise_psd must have equal length")
+    if radial_points.size < 2:
+        raise ValueError("at least two radial PSD samples are required")
+    if not np.all(np.isfinite(radial_points)) or not np.all(np.isfinite(noise_psd)):
+        raise ValueError("radial_points and noise_psd must be finite")
+    if np.any(np.diff(radial_points) <= 0):
+        raise ValueError("radial_points must be strictly increasing")
+    if radial_points[0] < 0 or radial_points[-1] > np.pi:
+        raise ValueError("radial_points must lie in [0, pi]")
+    if not isinstance(patch_size, (int, np.integer)) or isinstance(
+        patch_size,
+        (bool, np.bool_),
+    ):
+        raise ValueError("patch_size must be an integer")
+    if patch_size < 2:
+        raise ValueError("patch_size must be at least 2")
+    if not isinstance(support_radius, (int, np.integer)) or isinstance(
+        support_radius,
+        (bool, np.bool_),
+    ):
+        raise ValueError("support_radius must be an integer")
+    if not 0 <= support_radius < patch_size:
+        raise ValueError("support_radius must lie in [0, patch_size)")
+    if regularization_fraction < 0:
+        raise ValueError("regularization_fraction must be nonnegative")
+    if not 0 <= taper_fraction <= 1:
+        raise ValueError("taper_fraction must lie in [0, 1]")
+
+    stable_noise_psd = np.maximum(noise_psd, 0)
+    stable_noise_psd += (
+        regularization_fraction * np.median(stable_noise_psd)
+    )
+    if not np.any(stable_noise_psd > 0):
+        raise ValueError("regularized noise_psd must contain a positive value")
+
+    design_size = 2 * patch_size - 1
+    frequency_axis = 2 * np.pi * np.fft.fftshift(
+        np.fft.fftfreq(design_size, d=1.0)
+    )
+    frequency_z, frequency_y, frequency_x = np.meshgrid(
+        frequency_axis,
+        frequency_axis,
+        frequency_axis,
+        indexing="ij",
+    )
+    frequency_radius = np.sqrt(
+        frequency_z**2 + frequency_y**2 + frequency_x**2
+    )
+    frequency_radius = np.minimum(
+        frequency_radius,
+        radial_points[-1],
+    )
+    noise_psd_cube = np.interp(
+        frequency_radius,
+        radial_points,
+        stable_noise_psd,
+    )
+    spectral_floor = np.finfo(np.float64).eps * max(
+        float(np.max(noise_psd_cube)),
+        1.0,
+    )
+    whitening_response = np.zeros_like(noise_psd_cube)
+    supported_frequencies = noise_psd_cube > spectral_floor
+    whitening_response[supported_frequencies] = np.reciprocal(
+        np.sqrt(noise_psd_cube[supported_frequencies])
+    )
+    whitening_response *= _radial_bandpass_response(
+        frequency_radius,
+        bandpass_low_fraction,
+        bandpass_high_fraction,
+    )
+
+    full_filter = np.fft.fftshift(
+        np.fft.ifftn(np.fft.ifftshift(whitening_response))
+    ).real
+    full_filter = 0.5 * (
+        full_filter + np.flip(full_filter, axis=(0, 1, 2))
+    )
+
+    center = design_size // 2
+    start = center - support_radius
+    stop = center + support_radius + 1
+    finite_filter = full_filter[start:stop, start:stop, start:stop].copy()
+
+    spatial_axis = np.arange(-support_radius, support_radius + 1)
+    spatial_z, spatial_y, spatial_x = np.meshgrid(
+        spatial_axis,
+        spatial_axis,
+        spatial_axis,
+        indexing="ij",
+    )
+    spatial_radius = np.sqrt(
+        spatial_z**2 + spatial_y**2 + spatial_x**2
+    )
+    if taper_fraction == 0 or support_radius == 0:
+        taper = (spatial_radius <= support_radius).astype(np.float64)
+    else:
+        transition_start = support_radius * (1 - taper_fraction)
+        transition_width = support_radius - transition_start
+        phase = np.clip(
+            (spatial_radius - transition_start) / transition_width,
+            0,
+            1,
+        )
+        taper = 0.5 * (1 + np.cos(np.pi * phase))
+        taper = np.where(spatial_radius <= support_radius, taper, 0)
+
+    finite_filter *= taper
+    if bandpass_low_fraction > 0:
+        supported = taper > 0
+        finite_filter[supported] -= (
+            np.sum(finite_filter) / np.count_nonzero(supported)
+        )
+    return finite_filter
+
+
+def _radial_bandpass_response(
+    frequency_radius: npt.NDArray[np.float64],
+    low_fraction: float,
+    high_fraction: float,
+) -> npt.NDArray[np.float64]:
+    """Return the legacy hard radial pass band on a frequency-radius grid."""
+    if not 0 <= low_fraction < 1:
+        raise ValueError("low_fraction must lie in [0, 1)")
+    if not 0 <= high_fraction < 1:
+        raise ValueError("high_fraction must lie in [0, 1)")
+    if low_fraction + high_fraction >= 1:
+        raise ValueError("low_fraction + high_fraction must be less than 1")
+    low_cutoff = low_fraction * np.pi
+    high_cutoff = (1 - high_fraction) * np.pi
+    return np.asarray(
+        (frequency_radius >= low_cutoff)
+        & (frequency_radius <= high_cutoff),
+        dtype=np.float64,
+    )
+
+
+def construct_finite_bandpass_filter(
+    patch_size: int,
+    support_radius: int,
+    *,
+    low_fraction: float = 0.05,
+    high_fraction: float = 0.05,
+    taper_fraction: float = 0.2,
+) -> npt.NDArray[np.float64]:
+    """Approximate the global radial band-pass by a finite spatial filter.
+
+    The ideal hard cutoff has infinite spatial support.  This routine designs
+    it on the same ``2 * patch_size - 1`` frequency grid used by whitening,
+    crops it to a spherical support, and tapers the outer spatial samples.
+    Applying the result to a haloed subvolume and retaining only its core is
+    overlap-save filtering and therefore has no internal subvolume seams.
+    """
+    if patch_size < 2:
+        raise ValueError("patch_size must be at least 2")
+    if not 0 <= support_radius < patch_size:
+        raise ValueError("support_radius must lie in [0, patch_size)")
+    if not 0 <= taper_fraction <= 1:
+        raise ValueError("taper_fraction must lie in [0, 1]")
+
+    design_size = 2 * patch_size - 1
+    frequency_axis = 2 * np.pi * np.fft.fftshift(
+        np.fft.fftfreq(design_size, d=1.0)
+    )
+    frequency_z, frequency_y, frequency_x = np.meshgrid(
+        frequency_axis,
+        frequency_axis,
+        frequency_axis,
+        indexing="ij",
+    )
+    frequency_radius = np.sqrt(
+        frequency_z**2 + frequency_y**2 + frequency_x**2
+    )
+    response = _radial_bandpass_response(
+        frequency_radius,
+        low_fraction,
+        high_fraction,
+    )
+    full_filter = np.fft.fftshift(
+        np.fft.ifftn(np.fft.ifftshift(response))
+    ).real
+    full_filter = 0.5 * (
+        full_filter + np.flip(full_filter, axis=(0, 1, 2))
+    )
+
+    center = design_size // 2
+    start = center - support_radius
+    stop = center + support_radius + 1
+    finite_filter = full_filter[start:stop, start:stop, start:stop].copy()
+    spatial_axis = np.arange(-support_radius, support_radius + 1)
+    spatial_z, spatial_y, spatial_x = np.meshgrid(
+        spatial_axis,
+        spatial_axis,
+        spatial_axis,
+        indexing="ij",
+    )
+    spatial_radius = np.sqrt(spatial_z**2 + spatial_y**2 + spatial_x**2)
+    if taper_fraction == 0 or support_radius == 0:
+        taper = (spatial_radius <= support_radius).astype(np.float64)
+    else:
+        transition_start = support_radius * (1 - taper_fraction)
+        transition_width = support_radius - transition_start
+        phase = np.clip(
+            (spatial_radius - transition_start) / transition_width,
+            0,
+            1,
+        )
+        taper = 0.5 * (1 + np.cos(np.pi * phase))
+        taper = np.where(spatial_radius <= support_radius, taper, 0)
+    finite_filter *= taper
+
+    # The low-frequency stop band should reject constants exactly even after
+    # spatial truncation.  This also removes the need for a global mean pass.
+    if low_fraction > 0:
+        supported = taper > 0
+        finite_filter[supported] -= (
+            np.sum(finite_filter) / np.count_nonzero(supported)
+        )
+    return finite_filter
 
 
 def prewhiten_tomogram(

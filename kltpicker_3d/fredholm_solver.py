@@ -1,5 +1,7 @@
 """Nyström solver for the radial three-dimensional KLT equation."""
 
+from __future__ import annotations
+
 import numpy as np
 import numpy.typing as npt
 from scipy.special import roots_legendre, spherical_jn

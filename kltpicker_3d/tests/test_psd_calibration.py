@@ -3,6 +3,7 @@ from numpy.testing import assert_allclose
 
 from kltpicker_3d.utils import (
     calibrate_radial_psds,
+    construct_finite_whitening_filter,
     prewhiten_tomogram,
     radial_psd_to_variance,
 )
@@ -106,3 +107,46 @@ def test_prewhitening_reverses_a_known_isotropic_noise_color():
     expected = white / np.linalg.norm(white)
 
     assert_allclose(whitened, expected, rtol=2e-5, atol=2e-7)
+
+
+def test_finite_whitening_filter_for_flat_psd_is_centered_impulse():
+    points = np.linspace(0.0, np.pi, 17)
+    noise_psd = np.full_like(points, 4.0)
+
+    whitening_filter = construct_finite_whitening_filter(
+        points,
+        noise_psd,
+        patch_size=7,
+        support_radius=2,
+        regularization_fraction=0.0,
+    )
+
+    expected = np.zeros((5, 5, 5))
+    expected[2, 2, 2] = 0.5
+    assert_allclose(whitening_filter, expected, atol=1e-15)
+
+
+def test_finite_whitening_filter_has_requested_spherical_support():
+    points = np.linspace(0.0, np.pi, 33)
+    noise_psd = 0.5 + np.exp(-(points / 0.8) ** 2)
+    support_radius = 3
+
+    whitening_filter = construct_finite_whitening_filter(
+        points,
+        noise_psd,
+        patch_size=9,
+        support_radius=support_radius,
+    )
+
+    axis = np.arange(-support_radius, support_radius + 1)
+    z, y, x = np.meshgrid(axis, axis, axis, indexing="ij")
+    outside_support = z**2 + y**2 + x**2 > support_radius**2
+
+    assert whitening_filter.shape == (7, 7, 7)
+    assert np.isfinite(whitening_filter).all()
+    assert_allclose(
+        whitening_filter,
+        np.flip(whitening_filter, axis=(0, 1, 2)),
+        atol=1e-15,
+    )
+    assert_allclose(whitening_filter[outside_support], 0)

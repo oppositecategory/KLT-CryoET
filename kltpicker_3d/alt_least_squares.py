@@ -1,7 +1,8 @@
 """Nonnegative rank-one factorization of radial power spectra."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -9,19 +10,7 @@ import jax.numpy as jnp
 _DEFAULT_RANDOM_SEED = 1701
 
 
-@partial(
-    jax.tree_util.register_dataclass,
-    data_fields=[
-        "alpha_prev",
-        "gamma_prev",
-        "v_prev",
-        "alpha",
-        "gamma",
-        "v",
-        "iter_num",
-    ],
-    meta_fields=[],
-)
+@jax.tree_util.register_pytree_node_class
 @dataclass
 class RpsdFactorization:
     """State and result of the alternating least-squares iteration.
@@ -46,6 +35,30 @@ class RpsdFactorization:
     gamma: jax.Array
     v: jax.Array
     iter_num: jax.Array | int = 0
+
+    def tree_flatten(self) -> tuple[tuple[jax.Array | int, ...], None]:
+        """Expose every ALS state field as a JAX pytree child."""
+        return (
+            (
+                self.alpha_prev,
+                self.gamma_prev,
+                self.v_prev,
+                self.alpha,
+                self.gamma,
+                self.v,
+                self.iter_num,
+            ),
+            None,
+        )
+
+    @classmethod
+    def tree_unflatten(
+        cls,
+        _auxiliary_data: None,
+        children: tuple[jax.Array | int, ...],
+    ) -> RpsdFactorization:
+        """Reconstruct ALS state for JAX transformations and control flow."""
+        return cls(*children)
 
 
 # Backward compatibility for notebooks and downstream imports.
