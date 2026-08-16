@@ -209,7 +209,7 @@ def distributed_block_qr_score_parameters(
 ]:
     """Compute independent QR likelihood bases for every ``(ell, m)`` block.
 
-    Same-width blocks are processed concurrently across the selected devices.
+    Same-width blocks are dispatched independently across the selected devices.
     No Gram-matrix precheck is performed: block QR is the scoring definition.
     Cross-block orthogonality follows the spherical-harmonic construction.
     """
@@ -251,9 +251,8 @@ def distributed_block_qr_score_parameters(
             len(blocks),
             len(selected_devices),
         )
-        mapped_qr = jax.pmap(
+        compiled_qr = jax.jit(
             partial(_qr_score_block, noise_variance=float(noise_variance)),
-            devices=selected_devices,
         )
         for round_start in range(0, len(blocks), len(selected_devices)):
             round_blocks = blocks[round_start : round_start + len(selected_devices)]
@@ -264,33 +263,36 @@ def distributed_block_qr_score_parameters(
                 // len(selected_devices),
                 len(round_blocks),
             )
-            host_templates = np.zeros(
-                (len(selected_devices), voxel_count, width),
-                dtype=np.complex64,
-            )
-            host_eigenvalues = np.zeros(
-                (len(selected_devices), width),
-                dtype=np.float32,
-            )
+            pending_results = []
             for slot, indices in enumerate(round_blocks):
-                host_templates[slot] = np.asarray(
+                host_templates = np.asarray(
                     template_array[indices],
                     dtype=np.complex64,
                 ).reshape(width, voxel_count).T
-                host_eigenvalues[slot] = eigenvalues[indices]
+                device = selected_devices[slot]
+                device_templates = jax.device_put(host_templates, device)
+                device_eigenvalues = jax.device_put(eigenvalues[indices], device)
+                pending_results.append(
+                    (
+                        indices,
+                        compiled_qr(device_templates, device_eigenvalues),
+                    )
+                )
 
-            device_result = mapped_qr(host_templates, host_eigenvalues)
-            basis_blocks, weight_blocks, offsets, eigenvalue_blocks = (
-                np.asarray(value) for value in device_result
-            )
-            for slot, indices in enumerate(round_blocks):
-                score_templates[indices] = basis_blocks[slot].reshape(
+            # JAX dispatch is asynchronous. Launch every independent block
+            # before gathering any result so the selected GPUs work in
+            # parallel without a replicated pmap computation or collectives.
+            for indices, device_result in pending_results:
+                basis_block, weight_block, offset, eigenvalue_block = (
+                    np.asarray(value) for value in device_result
+                )
+                score_templates[indices] = basis_block.reshape(
                     width,
                     *template_array.shape[1:],
                 )
-                score_weights[indices] = weight_blocks[slot]
-                signal_eigenvalues[indices] = eigenvalue_blocks[slot]
-                total_offset += float(offsets[slot])
+                score_weights[indices] = weight_block
+                signal_eigenvalues[indices] = eigenvalue_block
+                total_offset += float(offset)
     return (
         score_templates,
         score_weights,

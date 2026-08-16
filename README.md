@@ -226,8 +226,9 @@ $$
 $$
 
 distinct `(ell, m)` groups. These are not merely 16 templates: each group
-contains many radial modes indexed by `n`. The present EMPIAR configuration
-typically retains approximately 609 complete `(ell, n, m)` templates.
+contains multiple radial modes indexed by `n`. In the current EMPIAR run, the
+99% energy criterion retained 39 `(ell, n)` radial modes, which expand through
+their `m` multiplicities to 153 complete `(ell, n, m)` templates.
 
 The multi-GPU score model performs QR independently within each fixed `(ell,m)`
 block while varying `n`, then diagonalizes the transformed signal covariance.
@@ -235,8 +236,8 @@ The resulting scoring basis is stored as complex64 and repartitioned evenly
 over the GPUs.
 
 During scoring, the subvolume FFT is reused. Each GPU multiplies it by its
-template spectra and performs inverse FFTs for the spatial responses. With 609
-templates and seven GPUs, each GPU receives approximately 87 templates.
+template spectra and performs inverse FFTs for the spatial responses. With 153
+templates and seven GPUs, each GPU receives approximately 22 templates.
 `--score-template-batch-size 1` evaluates one of those local templates at a
 time; larger values use batched inverse FFTs but increase peak memory sharply.
 
