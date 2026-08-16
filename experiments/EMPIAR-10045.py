@@ -28,16 +28,27 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from kltpicker_3d.multi_gpu import MultiGPUKLTParticleDetector3D
 from kltpicker_3d.streaming import MrcVolumeSource
 
+# DATASET_ROOT = Path(
+#     "/luke_leia_data/yoelsh/datasets/10045/pristine/data/ribosomes"
+# )
+# DEFAULT_INPUT = DATASET_ROOT / "Tomograms/08/IS002_291013_008.mrc"
+# DEFAULT_GROUND_TRUTH = (
+#     DATASET_ROOT
+#     / "AnticipatedResults/Tomograms/08/IS002_291013_008.coords"
+# )
+# DEFAULT_RESULTS_DIR = REPOSITORY_ROOT / "results/empiar-10045-bandpass-block-qr"
+
+
 DATASET_ROOT = Path(
-    "/luke_leia_data/yoelsh/datasets/10045/pristine/data/ribosomes"
+    "/data/yoelsh/datasets/10045/pristine/data/ribosomes"
 )
 DEFAULT_INPUT = DATASET_ROOT / "Tomograms/08/IS002_291013_008.mrc"
 DEFAULT_GROUND_TRUTH = (
     DATASET_ROOT
     / "AnticipatedResults/Tomograms/08/IS002_291013_008.coords"
 )
-DEFAULT_RESULTS_DIR = REPOSITORY_ROOT / "results/empiar-10045"
-DEFAULT_INITIAL_RPSDS = REPOSITORY_ROOT / "results/empiar-10045-rpsds.pkl"
+DEFAULT_RESULTS_DIR = REPOSITORY_ROOT / "results/empiar-10045-bandpass-block-qr"
+
 LOGGER = logging.getLogger("empiar-10045")
 T = TypeVar("T")
 
@@ -56,8 +67,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--initial-rpsds",
         type=Path,
-        default=DEFAULT_INITIAL_RPSDS,
-        help="Existing first-pass checkpoint; ignored with --recompute-initial.",
+        help=(
+            "Existing band-pass first-pass checkpoint; ignored with "
+            "--recompute-initial. Raw legacy RPSDs are not compatible."
+        ),
     )
     parser.add_argument("--recompute-initial", action="store_true")
     parser.add_argument("--particle-diameter", type=float, default=270.0)
@@ -73,6 +86,8 @@ def parse_args() -> argparse.Namespace:
         default=37,
         metavar="VOXELS",
     )
+    parser.add_argument("--bandpass-low-fraction", type=float, default=0.05)
+    parser.add_argument("--bandpass-high-fraction", type=float, default=0.05)
     parser.add_argument(
         "--match-radius-angstrom",
         type=float,
@@ -91,8 +106,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--candidate-capacity-per-subvolume",
         type=int,
-        default=2_000_000,
-        help="Static local-max output capacity; overflow fails explicitly.",
+        default=4_096,
+        help=(
+            "Number of highest 3x3x3 local maxima retained per subvolume "
+            "before global ranking and NMS."
+        ),
     )
     parser.add_argument("--legendre-order", type=int, default=150)
     parser.add_argument(
@@ -302,6 +320,49 @@ def load_pickle(path: Path) -> Any:
     """Load a trusted local pipeline checkpoint."""
     with path.open("rb") as stream:
         return pickle.load(stream)
+
+
+def prepare_block_qr_checkpoint(
+    detector: MultiGPUKLTParticleDetector3D,
+    templates: npt.ArrayLike,
+    noise_variance: float,
+    path: Path,
+) -> None:
+    """Build the large block-QR basis directly into an atomic NPY file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_stream = tempfile.NamedTemporaryFile(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    temporary = Path(temporary_stream.name)
+    temporary_stream.close()
+    try:
+        template_array = np.asanyarray(templates)
+        output = np.lib.format.open_memmap(
+            temporary,
+            mode="w+",
+            dtype=np.complex64,
+            shape=template_array.shape,
+        )
+        detector.prepare_score_filters(
+            template_array,
+            noise_variance,
+            output=output,
+        )
+        output.flush()
+        detector.score_templates = None
+        del output
+        os.replace(temporary, path)
+        detector.score_templates = np.load(
+            path,
+            mmap_mode="r",
+            allow_pickle=False,
+        )
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def run_stage(name: str, function: Callable[[], T]) -> tuple[T, float]:
@@ -521,6 +582,13 @@ def log_plan(
         detector.model.template_side,
     )
     LOGGER.info(
+        "Preprocessing: finite band-pass removes low/high %.1f%%/%.1f%% | "
+        "support=%d | score basis=(ell,m) block QR",
+        100 * detector.bandpass_low_fraction,
+        100 * detector.bandpass_high_fraction,
+        whitening_halo,
+    )
+    LOGGER.info(
         "Halos: whitening=%d | template=%d | local-max=1 | scoring total=%d",
         whitening_halo,
         template_radius,
@@ -562,6 +630,12 @@ def main() -> None:
     configure_logging(log_file)
     started = time.perf_counter()
     stage_times: dict[str, float] = {}
+    LOGGER.info(
+        "Experiment process started | pid=%d | results=%s",
+        os.getpid(),
+        args.results_dir,
+    )
+    LOGGER.info("Initializing input metadata and JAX devices")
 
     try:
         if not args.input.is_file():
@@ -610,6 +684,8 @@ def main() -> None:
                 mgscale=1.0 / voxel_size,
                 num_particles=truth_count,
                 whitening_support_radius=args.whitening_support_radius,
+                bandpass_low_fraction=args.bandpass_low_fraction,
+                bandpass_high_fraction=args.bandpass_high_fraction,
                 devices=devices,
                 core_patch_shape=(
                     None
@@ -652,6 +728,9 @@ def main() -> None:
                 "core_shape": detector.processor.core_shape,
                 "devices": [device.device_kind for device in devices],
                 "whitening_support_radius": args.whitening_support_radius,
+                "bandpass_low_fraction": args.bandpass_low_fraction,
+                "bandpass_high_fraction": args.bandpass_high_fraction,
+                "score_basis": "distributed_block_qr_by_ell_m_v1",
                 "template_side": detector.model.template_side,
                 "fredholm_radius_voxels": detector.model.fredholm_radius_voxels,
                 "max_order": detector.model.max_order,
@@ -675,6 +754,18 @@ def main() -> None:
                 return
 
             initial_path = args.results_dir / "01_initial_patch_rpsds.pkl"
+            detector.bandpass_filter = detector.build_bandpass_filter()
+            save_npy(
+                detector.bandpass_filter,
+                args.results_dir / "00_bandpass_filter.npy",
+            )
+            LOGGER.info(
+                "Finite band-pass: low=%.3f high=%.3f support=%d L2=%.8g",
+                args.bandpass_low_fraction,
+                args.bandpass_high_fraction,
+                args.whitening_support_radius,
+                np.linalg.norm(detector.bandpass_filter),
+            )
             if args.resume and initial_path.is_file():
                 LOGGER.info(
                     "STAGE RESUME | initial RPSDs | loading %s",
@@ -684,6 +775,7 @@ def main() -> None:
                 record_stage_time(stage_times, "initial_rpsds", 0.0)
             elif (
                 not args.recompute_initial
+                and args.initial_rpsds is not None
                 and args.initial_rpsds.is_file()
             ):
                 if initial_path.exists() and not args.overwrite:
@@ -701,7 +793,10 @@ def main() -> None:
                 detector.initial_rpsds, elapsed = checkpointed_stage(
                     "1/8 initial streamed patch RPSDs",
                     initial_path,
-                    detector.estimate_rpsds,
+                    lambda: detector.estimate_rpsds(
+                        detector.bandpass_filter,
+                        description="Band-passed RPSD extraction",
+                    ),
                     resume=args.resume,
                     overwrite=args.overwrite,
                 )
@@ -726,7 +821,7 @@ def main() -> None:
             log_array("Initial noise PSD", detector.initial_model.noise_psd)
 
             detector.whitening_filter, elapsed = checkpointed_stage(
-                "3/8 finite whitening filter construction",
+                "3/8 finite combined band-pass/whitening filter construction",
                 args.results_dir / "03_whitening_filter.pkl",
                 lambda: detector.build_whitening_filter(
                     detector.initial_model.noise_psd
@@ -748,7 +843,10 @@ def main() -> None:
             detector.whitened_rpsds, elapsed = checkpointed_stage(
                 "4/8 whitened streamed patch RPSDs",
                 args.results_dir / "04_whitened_patch_rpsds.pkl",
-                lambda: detector.estimate_rpsds(detector.whitening_filter),
+                lambda: detector.estimate_rpsds(
+                    detector.whitening_filter,
+                    description="Band-passed whitened RPSD extraction",
+                ),
                 resume=args.resume,
                 overwrite=args.overwrite,
             )
@@ -939,13 +1037,25 @@ def main() -> None:
                 detector.templates.shape[1:],
             )
 
-            score_model_path = args.results_dir / "06_score_model.npz"
-            if args.resume and score_model_path.is_file():
+            score_templates_path = args.results_dir / "06b_block_qr_templates.npy"
+            score_model_path = args.results_dir / "06b_block_qr_score_model.npz"
+            if (
+                args.resume
+                and score_templates_path.is_file()
+                and score_model_path.is_file()
+            ):
                 LOGGER.info(
-                    "STAGE RESUME | orthogonal KLT score model | loading %s",
+                    "STAGE RESUME | (ell,m) block-QR score model | loading %s",
                     score_model_path,
                 )
+                detector.score_templates = np.load(
+                    score_templates_path,
+                    mmap_mode="r",
+                    allow_pickle=False,
+                )
                 with np.load(score_model_path, allow_pickle=False) as score_model:
+                    if score_model["method"].item() != "block_qr_ell_m_v1":
+                        raise RuntimeError("incompatible score-model checkpoint")
                     if (
                         "noise_variance" in score_model
                         and not np.isclose(
@@ -966,16 +1076,22 @@ def main() -> None:
                         "adjusted_template_eigenvalues"
                     ].copy()
             else:
-                require_replaceable((score_model_path,), overwrite=args.overwrite)
+                require_replaceable(
+                    (score_templates_path, score_model_path),
+                    overwrite=args.overwrite,
+                )
                 run_stage(
-                    "6b/8 orthogonal KLT score-filter normalization",
-                    lambda: detector.prepare_score_filters(
+                    "6b/8 distributed (ell,m) block QR and score model",
+                    lambda: prepare_block_qr_checkpoint(
+                        detector,
                         detector.templates,
                         detector.whitened_model.noise_variance,
+                        score_templates_path,
                     ),
                 )
                 save_npz(
                     score_model_path,
+                    method=np.asarray("block_qr_ell_m_v1"),
                     template_normalization=detector.template_normalization,
                     score_weights=detector.score_weights,
                     score_offset=np.asarray(detector.score_offset),
@@ -987,10 +1103,12 @@ def main() -> None:
                     ),
                 )
             log_array("KLT score weights", detector.score_weights)
+            LOGGER.info("Block-QR score templates: %s", score_templates_path)
             LOGGER.info("KLT likelihood offset: %.8g", detector.score_offset)
 
-            candidates_path = args.results_dir / "07_candidates.npy"
-            score_plan_path = args.results_dir / "07_score_plan.json"
+            candidate_tag = f"top{args.candidate_capacity_per_subvolume}"
+            candidates_path = args.results_dir / f"07_candidates_{candidate_tag}.npy"
+            score_plan_path = args.results_dir / f"07_score_plan_{candidate_tag}.json"
             if args.resume and candidates_path.is_file():
                 LOGGER.info(
                     "STAGE RESUME | scoring candidates | loading %s",
@@ -1006,7 +1124,7 @@ def main() -> None:
                 detector.candidates, elapsed = run_stage(
                     "7/8 fused whitening, KLT scoring, and local maxima",
                     lambda: detector.score_candidates(
-                        detector.templates,
+                        detector.score_templates,
                         detector.whitened_model.noise_variance,
                         detector.whitening_filter,
                     ),
@@ -1022,7 +1140,9 @@ def main() -> None:
             if len(detector.candidates):
                 log_array("Candidate raw scores", detector.candidates[:, 3])
 
-            particles_path = args.results_dir / "08_particles_zyx.npy"
+            particles_path = (
+                args.results_dir / f"08_particles_{candidate_tag}_zyx.npy"
+            )
             if args.resume and particles_path.is_file():
                 LOGGER.info(
                     "STAGE RESUME | global NMS | loading %s",

@@ -10,11 +10,94 @@ from kltpicker_3d.multi_gpu import (
     compute_fused_klt_score_shard,
     compute_klt_score_block,
     construct_klt_score_filters,
+    distributed_block_qr_score_parameters,
+    extract_score_candidates,
     orthogonal_klt_score_parameters,
     plan_template_fft_batch,
     ranked_candidate_nms_3d,
 )
 from kltpicker_3d.streaming import ArrayVolumeSource
+from kltpicker_3d.utils import construct_finite_bandpass_filter
+
+
+def test_finite_bandpass_rejects_constant_and_has_bounded_support():
+    kernel = construct_finite_bandpass_filter(
+        patch_size=9,
+        support_radius=3,
+        low_fraction=0.05,
+        high_fraction=0.05,
+    )
+
+    assert kernel.shape == (7, 7, 7)
+    assert_allclose(np.sum(kernel), 0, atol=1e-12)
+    grid = np.indices(kernel.shape) - 3
+    outside = np.sum(grid**2, axis=0) > 3**2
+    assert_array_equal(kernel[outside], 0)
+
+
+def test_candidate_top_k_reports_full_count_and_retains_only_capacity():
+    scores = np.zeros((7, 7, 7), dtype=np.float32)
+    scores[2, 2, 2] = 3
+    scores[4, 4, 4] = 2
+
+    coordinates, values, count = extract_score_candidates(
+        jnp.asarray(scores),
+        jnp.full(3, 5, dtype=jnp.int32),
+        core_shape=(5, 5, 5),
+        source_shape=(20, 20, 20),
+        template_radius=0,
+        candidate_capacity=1,
+    )
+
+    assert int(count) == 2
+    assert_array_equal(np.asarray(coordinates), np.array([[1, 1, 1]]))
+    assert_allclose(np.asarray(values), np.array([3], dtype=np.float32))
+
+
+def test_distributed_block_qr_preserves_each_signal_covariance():
+    rng = np.random.default_rng(123)
+    templates = (
+        rng.standard_normal((4, 3, 3, 3))
+        + 1j * rng.standard_normal((4, 3, 3, 3))
+    ).astype(np.complex64)
+    eigenvalues = np.array([4.0, 1.5, 3.0, 0.5], dtype=np.float32)
+    orders = np.array([0, 0, 1, 1])
+    m_values = np.array([0, 0, 0, 0])
+
+    basis, weights, offset, transformed_eigenvalues = (
+        distributed_block_qr_score_parameters(
+            templates,
+            eigenvalues,
+            orders,
+            m_values,
+            noise_variance=0.8,
+            devices=(jax.devices()[0],),
+        )
+    )
+
+    for indices in (np.array([0, 1]), np.array([2, 3])):
+        original = templates[indices].reshape(2, -1).T
+        transformed = basis[indices].reshape(2, -1).T
+        expected_covariance = (
+            original * eigenvalues[indices][None, :]
+        ) @ original.conj().T
+        actual_covariance = (
+            transformed * transformed_eigenvalues[indices][None, :]
+        ) @ transformed.conj().T
+        assert_allclose(actual_covariance, expected_covariance, rtol=2e-5, atol=2e-5)
+        assert_allclose(
+            transformed.conj().T @ transformed,
+            np.eye(2),
+            rtol=2e-5,
+            atol=2e-5,
+        )
+    expected_weights = 1 / 0.8 - 1 / (0.8 + transformed_eigenvalues)
+    assert_allclose(weights, expected_weights, rtol=2e-5)
+    assert_allclose(
+        offset,
+        np.sum(np.log1p(transformed_eigenvalues / 0.8)),
+        rtol=2e-5,
+    )
 
 
 def test_fused_batched_fft_matches_sequential_convolution():
@@ -120,6 +203,8 @@ def test_streamed_candidates_match_complete_volume_scoring():
         mgscale=1,
         num_particles=20,
         whitening_support_radius=1,
+        bandpass_low_fraction=0,
+        bandpass_high_fraction=0,
         devices=tuple(jax.devices()),
         core_patch_shape=(2, 2, 2),
         candidate_capacity_per_subvolume=6**3,
@@ -128,17 +213,18 @@ def test_streamed_candidates_match_complete_volume_scoring():
         template_side=3,
     )
     detector.model.eigvals = template_eigenvalues
+    detector.model.template_orders = np.zeros(2, dtype=np.int64)
+    detector.model.template_m_values = np.zeros(2, dtype=np.int64)
+    kernels, weights, offset, _ = detector.prepare_score_filters(
+        templates,
+        noise_variance,
+    )
     streamed = detector.score_candidates(
         templates,
         noise_variance,
         whitening_filter,
     )
 
-    kernels, weights, offset = construct_klt_score_filters(
-        templates,
-        template_eigenvalues,
-        noise_variance,
-    )
     whitened = fftconvolve(volume, whitening_filter, mode="same")
     complete_score = np.zeros(
         tuple(size - 2 for size in volume.shape),
@@ -197,6 +283,8 @@ def test_complete_multi_gpu_detector_executes_on_streamed_volume():
         mgscale=1,
         num_particles=2,
         whitening_support_radius=1,
+        bandpass_low_fraction=0,
+        bandpass_high_fraction=0,
         devices=(jax.devices()[0],),
         core_patch_shape=(2, 2, 2),
         candidate_capacity_per_subvolume=10**3,

@@ -755,6 +755,7 @@ def extract_streamed_rpsds(
     patches_per_microbatch: int = 8,
     max_acf_distance_fraction: float = 0.3,
     spatial_filter: npt.ArrayLike | None = None,
+    description: str | None = None,
 ) -> RpsdExtractionResult:
     """Extract all patch RPSDs using a reusable multi-GPU processor."""
     if patch_size < 3 or patch_size % 2 == 0:
@@ -794,13 +795,15 @@ def extract_streamed_rpsds(
         halo = 0
         subvolume_function = extract_patch_rpsds
         function_arguments = (shell_ids, shell_counts)
-        description = "RPSD extraction"
+        progress_description = "RPSD extraction"
     else:
         spatial_filter = np.asarray(spatial_filter, dtype=np.float32)
         halo = spatial_filter_radius(spatial_filter)
         subvolume_function = whiten_and_extract_patch_rpsds
         function_arguments = (spatial_filter, shell_ids, shell_counts)
-        description = "Whitened RPSD extraction"
+        progress_description = "Filtered RPSD extraction"
+    if description is not None:
+        progress_description = description
     static_kwargs["halo"] = halo
 
     outputs = processor.map(
@@ -808,7 +811,7 @@ def extract_streamed_rpsds(
         *function_arguments,
         halo=halo,
         static_kwargs=static_kwargs,
-        description=description,
+        description=progress_description,
     )
     for regions, (host_rpsds, host_variances) in outputs:
         for slot, region in enumerate(regions):

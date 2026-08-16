@@ -29,6 +29,7 @@ from kltpicker_3d.streaming import (
 from kltpicker_3d.tomogram import KLTParticleDetector3D
 from kltpicker_3d.utils import (
     calibrate_radial_psds,
+    construct_finite_bandpass_filter,
     construct_finite_whitening_filter,
 )
 
@@ -38,7 +39,11 @@ _LOCAL_MAXIMUM_RADIUS = 1
 _TEMPLATE_AXIS_NAME = "template_device"
 _DEFAULT_SCORE_MEMORY_FRACTION = 0.8
 _SCORE_FIXED_COMPLEX_ARRAYS = 5
-_SCORE_BATCH_COMPLEX_ARRAYS = 3
+# Batched 3-D cuFFT plans require substantial backend workspace in addition
+# to the visible padded filters, spectra, and responses. Eight complex-grid
+# equivalents is deliberately conservative; the original factor of three
+# selected B=3 for EMPIAR-10045 and cuFFT then requested another 2.42 GiB.
+_SCORE_BATCH_COMPLEX_ARRAYS = 8
 LOGGER = logging.getLogger(__name__)
 
 
@@ -151,6 +156,146 @@ def orthogonal_klt_score_parameters(
         np.asarray(weights, dtype=np.float32),
         np.float32(offset),
         adjusted_eigenvalues,
+    )
+
+
+def _qr_score_block(
+    flattened_templates: jax.Array,
+    template_eigenvalues: jax.Array,
+    noise_variance: float,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Transform one fixed ``(ell, m)`` block into likelihood eigenmodes."""
+    orthonormal_basis, triangular_factor = jnp.linalg.qr(
+        flattened_templates,
+        mode="reduced",
+    )
+    signal_covariance = (
+        triangular_factor * template_eigenvalues[None, :]
+    ) @ jnp.conj(triangular_factor.T)
+    signal_covariance = 0.5 * (
+        signal_covariance + jnp.conj(signal_covariance.T)
+    )
+    signal_eigenvalues, covariance_eigenvectors = jnp.linalg.eigh(
+        signal_covariance
+    )
+    signal_eigenvalues = jnp.maximum(signal_eigenvalues, 0)[::-1]
+    covariance_eigenvectors = covariance_eigenvectors[:, ::-1]
+    covariance_eigenvalues = noise_variance + signal_eigenvalues
+    score_weights = 1.0 / noise_variance - 1.0 / covariance_eigenvalues
+    score_offset = jnp.sum(jnp.log(covariance_eigenvalues / noise_variance))
+    score_basis = orthonormal_basis @ covariance_eigenvectors
+    return (
+        score_basis.T,
+        score_weights,
+        score_offset,
+        signal_eigenvalues,
+    )
+
+
+def distributed_block_qr_score_parameters(
+    templates: npt.ArrayLike,
+    template_eigenvalues: npt.ArrayLike,
+    template_orders: npt.ArrayLike,
+    template_m_values: npt.ArrayLike,
+    noise_variance: float,
+    *,
+    devices: Sequence[jax.Device] | None = None,
+    output: npt.NDArray[np.complex64] | None = None,
+) -> tuple[
+    npt.NDArray[np.complex64],
+    npt.NDArray[np.float32],
+    np.float32,
+    npt.NDArray[np.float64],
+]:
+    """Compute independent QR likelihood bases for every ``(ell, m)`` block.
+
+    Same-width blocks are processed concurrently across the selected devices.
+    No Gram-matrix precheck is performed: block QR is the scoring definition.
+    Cross-block orthogonality follows the spherical-harmonic construction.
+    """
+    template_array = np.asanyarray(templates)
+    eigenvalues = np.asarray(template_eigenvalues, dtype=np.float32)
+    orders = np.asarray(template_orders, dtype=np.int64)
+    m_values = np.asarray(template_m_values, dtype=np.int64)
+    if template_array.ndim != 4 or template_array.shape[0] < 1:
+        raise ValueError("templates must have shape (modes, z, y, x)")
+    mode_count = template_array.shape[0]
+    if any(values.shape != (mode_count,) for values in (eigenvalues, orders, m_values)):
+        raise ValueError("eigenvalues, orders, and m values must match templates")
+    if noise_variance <= 0 or not np.isfinite(noise_variance):
+        raise ValueError("noise_variance must be positive and finite")
+    selected_devices = tuple(jax.devices() if devices is None else devices)
+    if not selected_devices:
+        raise ValueError("at least one JAX device is required")
+
+    if output is None:
+        score_templates = np.empty(template_array.shape, dtype=np.complex64)
+    else:
+        if output.shape != template_array.shape or output.dtype != np.complex64:
+            raise ValueError("output must be complex64 with the template shape")
+        score_templates = output
+    score_weights = np.empty(mode_count, dtype=np.float32)
+    signal_eigenvalues = np.empty(mode_count, dtype=np.float64)
+    voxel_count = int(np.prod(template_array.shape[1:]))
+
+    blocks_by_width: dict[int, list[npt.NDArray[np.int64]]] = {}
+    for order, m_value in sorted(set(zip(orders.tolist(), m_values.tolist()))):
+        indices = np.flatnonzero((orders == order) & (m_values == m_value))
+        blocks_by_width.setdefault(indices.size, []).append(indices)
+
+    total_offset = 0.0
+    for width, blocks in sorted(blocks_by_width.items()):
+        LOGGER.info(
+            "Block QR: radial width=%d | angular blocks=%d | devices=%d",
+            width,
+            len(blocks),
+            len(selected_devices),
+        )
+        mapped_qr = jax.pmap(
+            partial(_qr_score_block, noise_variance=float(noise_variance)),
+            devices=selected_devices,
+        )
+        for round_start in range(0, len(blocks), len(selected_devices)):
+            round_blocks = blocks[round_start : round_start + len(selected_devices)]
+            LOGGER.info(
+                "Block QR round %d/%d: processing %d block(s)",
+                round_start // len(selected_devices) + 1,
+                (len(blocks) + len(selected_devices) - 1)
+                // len(selected_devices),
+                len(round_blocks),
+            )
+            host_templates = np.zeros(
+                (len(selected_devices), voxel_count, width),
+                dtype=np.complex64,
+            )
+            host_eigenvalues = np.zeros(
+                (len(selected_devices), width),
+                dtype=np.float32,
+            )
+            for slot, indices in enumerate(round_blocks):
+                host_templates[slot] = np.asarray(
+                    template_array[indices],
+                    dtype=np.complex64,
+                ).reshape(width, voxel_count).T
+                host_eigenvalues[slot] = eigenvalues[indices]
+
+            device_result = mapped_qr(host_templates, host_eigenvalues)
+            basis_blocks, weight_blocks, offsets, eigenvalue_blocks = (
+                np.asarray(value) for value in device_result
+            )
+            for slot, indices in enumerate(round_blocks):
+                score_templates[indices] = basis_blocks[slot].reshape(
+                    width,
+                    *template_array.shape[1:],
+                )
+                score_weights[indices] = weight_blocks[slot]
+                signal_eigenvalues[indices] = eigenvalue_blocks[slot]
+                total_offset += float(offsets[slot])
+    return (
+        score_templates,
+        score_weights,
+        np.float32(total_offset),
+        signal_eigenvalues,
     )
 
 
@@ -623,13 +768,15 @@ class MultiGPUKLTParticleDetector3D:
         num_particles: int,
         *,
         whitening_support_radius: int,
+        bandpass_low_fraction: float = 0.05,
+        bandpass_high_fraction: float = 0.05,
         devices: Sequence[jax.Device] | None = None,
         core_patch_shape: tuple[int, int, int] | None = None,
         device_memory_bytes: int | None = None,
         memory_fraction: float = 0.3,
         resident_volume_copies: int = 8,
         patches_per_microbatch: int = 1,
-        candidate_capacity_per_subvolume: int = 10000,
+        candidate_capacity_per_subvolume: int = 4096,
         legendre_order: int = 150,
         threshold: float = 0,
         max_iter: int = 500,
@@ -650,6 +797,12 @@ class MultiGPUKLTParticleDetector3D:
             raise ValueError("at least one JAX device is required")
         if whitening_support_radius < 0:
             raise ValueError("whitening_support_radius must be nonnegative")
+        if not 0 <= bandpass_low_fraction < 1:
+            raise ValueError("bandpass_low_fraction must lie in [0, 1)")
+        if not 0 <= bandpass_high_fraction < 1:
+            raise ValueError("bandpass_high_fraction must lie in [0, 1)")
+        if bandpass_low_fraction + bandpass_high_fraction >= 1:
+            raise ValueError("bandpass fractions must sum to less than one")
         if patches_per_microbatch < 1:
             raise ValueError("patches_per_microbatch must be positive")
         if candidate_capacity_per_subvolume < 1:
@@ -723,6 +876,8 @@ class MultiGPUKLTParticleDetector3D:
         self.patch_size = patch_size
         self.patches_per_microbatch = patches_per_microbatch
         self.whitening_support_radius = whitening_support_radius
+        self.bandpass_low_fraction = bandpass_low_fraction
+        self.bandpass_high_fraction = bandpass_high_fraction
         self.candidate_capacity_per_subvolume = candidate_capacity_per_subvolume
         self.device_memory_bytes = memory_limit
         self.score_template_batch_size = score_template_batch_size
@@ -737,11 +892,13 @@ class MultiGPUKLTParticleDetector3D:
         )
 
         self.initial_rpsds: RpsdExtractionResult | None = None
+        self.bandpass_filter: npt.NDArray[np.float32] | None = None
         self.initial_model: CalibratedRpsdModel | None = None
         self.whitening_filter: npt.NDArray[np.float32] | None = None
         self.whitened_rpsds: RpsdExtractionResult | None = None
         self.whitened_model: CalibratedRpsdModel | None = None
         self.templates: npt.NDArray[np.generic] | None = None
+        self.score_templates: npt.NDArray[np.complex64] | None = None
         self.template_normalization: npt.NDArray[np.float32] | None = None
         self.score_weights: npt.NDArray[np.float32] | None = None
         self.score_offset: np.float32 | None = None
@@ -752,6 +909,8 @@ class MultiGPUKLTParticleDetector3D:
     def estimate_rpsds(
         self,
         whitening_filter: npt.ArrayLike | None = None,
+        *,
+        description: str | None = None,
     ) -> RpsdExtractionResult:
         """Run streamed RPSD extraction, optionally with finite whitening."""
         return extract_streamed_rpsds(
@@ -759,6 +918,7 @@ class MultiGPUKLTParticleDetector3D:
             self.patch_size,
             patches_per_microbatch=self.patches_per_microbatch,
             spatial_filter=whitening_filter,
+            description=description,
         )
 
     def fit_rpsds(self, extraction: RpsdExtractionResult) -> CalibratedRpsdModel:
@@ -780,6 +940,20 @@ class MultiGPUKLTParticleDetector3D:
                 noise_psd,
                 self.patch_size,
                 self.whitening_support_radius,
+                bandpass_low_fraction=self.bandpass_low_fraction,
+                bandpass_high_fraction=self.bandpass_high_fraction,
+            ),
+            dtype=np.float32,
+        )
+
+    def build_bandpass_filter(self) -> npt.NDArray[np.float32]:
+        """Construct the finite streamed approximation to legacy preprocessing."""
+        return np.asarray(
+            construct_finite_bandpass_filter(
+                self.patch_size,
+                self.whitening_support_radius,
+                low_fraction=self.bandpass_low_fraction,
+                high_fraction=self.bandpass_high_fraction,
             ),
             dtype=np.float32,
         )
@@ -804,26 +978,38 @@ class MultiGPUKLTParticleDetector3D:
         self,
         templates: npt.ArrayLike,
         noise_variance: float,
+        *,
+        output: npt.NDArray[np.complex64] | None = None,
     ) -> tuple[
-        npt.NDArray[np.float32],
+        npt.NDArray[np.complex64],
         npt.NDArray[np.float32],
         np.float32,
         npt.NDArray[np.float64],
     ]:
-        """Prepare direct orthogonal-KLT normalization and likelihood terms."""
+        """Prepare distributed ``(ell, m)`` block-QR likelihood filters."""
         if self.model.eigvals is None:
             raise RuntimeError("template eigenvalues have not been initialized")
-        parameters = orthogonal_klt_score_parameters(
+        if self.model.template_orders is None or self.model.template_m_values is None:
+            raise RuntimeError("template angular metadata has not been initialized")
+        parameters = distributed_block_qr_score_parameters(
             templates,
             self.model.eigvals,
+            self.model.template_orders,
+            self.model.template_m_values,
             noise_variance,
+            devices=self.devices,
+            output=output,
         )
         (
-            self.template_normalization,
+            self.score_templates,
             self.score_weights,
             self.score_offset,
             self.adjusted_template_eigenvalues,
         ) = parameters
+        self.template_normalization = np.ones(
+            self.score_weights.shape,
+            dtype=np.float32,
+        )
         return parameters
 
     def score_candidates(
@@ -835,8 +1021,8 @@ class MultiGPUKLTParticleDetector3D:
         """Template-shard fused FFT scores and return globally located maxima."""
         if self.model.eigvals is None:
             raise RuntimeError("template eigenvalues have not been initialized")
-        templates = np.asanyarray(templates)
-        if templates.ndim != 4 or templates.shape[0] < 1:
+        raw_templates = np.asanyarray(templates)
+        if raw_templates.ndim != 4 or raw_templates.shape[0] < 1:
             raise ValueError("templates must have shape (modes, z, y, x)")
         whitening_filter = np.asarray(whitening_filter, dtype=np.float32)
         whitening_radius = spatial_filter_radius(whitening_filter)
@@ -845,9 +1031,11 @@ class MultiGPUKLTParticleDetector3D:
             or self.score_weights is None
             or self.score_offset is None
             or self.adjusted_template_eigenvalues is None
-            or self.template_normalization.shape != (templates.shape[0],)
+            or self.score_templates is None
+            or self.template_normalization.shape != (raw_templates.shape[0],)
         ):
-            self.prepare_score_filters(templates, noise_variance)
+            self.prepare_score_filters(raw_templates, noise_variance)
+        templates = np.asanyarray(self.score_templates)
         normalization = self.template_normalization
         score_weights = self.score_weights
         score_offset = self.score_offset
@@ -1012,6 +1200,9 @@ class MultiGPUKLTParticleDetector3D:
         )
 
         candidate_blocks = []
+        total_local_maxima = 0
+        retained_local_maxima = 0
+        truncated_subvolumes = 0
         valid_lower = np.full(3, template_radius)
         valid_upper = np.asarray(self.source.shape) - template_radius
         for region in tqdm(
@@ -1034,14 +1225,10 @@ class MultiGPUKLTParticleDetector3D:
                 np.asarray(output_leaf[0]) for output_leaf in output
             )
             candidate_count = int(local_counts)
-            if candidate_count > candidate_capacity:
-                raise RuntimeError(
-                    "candidate capacity exceeded in subvolume starting at "
-                    f"{region.start}: found {candidate_count}, capacity "
-                    f"{candidate_capacity}; increase "
-                    "candidate_capacity_per_subvolume"
-                )
             retained = min(candidate_count, candidate_capacity)
+            total_local_maxima += candidate_count
+            retained_local_maxima += retained
+            truncated_subvolumes += int(candidate_count > candidate_capacity)
             coordinates = (
                 np.asarray(local_coordinates[:retained])
                 + np.asarray(region.start)
@@ -1059,6 +1246,15 @@ class MultiGPUKLTParticleDetector3D:
                 )
         if not candidate_blocks:
             return np.empty((0, 4), dtype=np.float64)
+        LOGGER.info(
+            "Local-max retention: retained=%d / found=%d | top-K=%d | "
+            "truncated subvolumes=%d/%d",
+            retained_local_maxima,
+            total_local_maxima,
+            candidate_capacity,
+            truncated_subvolumes,
+            self.processor.subvolume_count,
+        )
         return np.asarray(np.concatenate(candidate_blocks), dtype=np.float64)
 
     def non_maximum_suppression(
@@ -1094,14 +1290,25 @@ class MultiGPUKLTParticleDetector3D:
 
     def process_tomogram(self) -> tuple[int, npt.NDArray[np.float64]]:
         """Run both RPSD iterations, templating, scoring, and global NMS."""
-        self.initial_rpsds = self.estimate_rpsds()
+        self.bandpass_filter = self.build_bandpass_filter()
+        self.initial_rpsds = self.estimate_rpsds(
+            self.bandpass_filter,
+            description="Band-passed RPSD extraction",
+        )
         self.initial_model = self.fit_rpsds(self.initial_rpsds)
         self.whitening_filter = self.build_whitening_filter(
             self.initial_model.noise_psd
         )
-        self.whitened_rpsds = self.estimate_rpsds(self.whitening_filter)
+        self.whitened_rpsds = self.estimate_rpsds(
+            self.whitening_filter,
+            description="Band-passed whitened RPSD extraction",
+        )
         self.whitened_model = self.fit_rpsds(self.whitened_rpsds)
         self.templates = self.build_templates(self.whitened_model.particle_psd)
+        self.prepare_score_filters(
+            self.templates,
+            self.whitened_model.noise_variance,
+        )
         self.candidates = self.score_candidates(
             self.templates,
             self.whitened_model.noise_variance,

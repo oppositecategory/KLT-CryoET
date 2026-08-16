@@ -178,3 +178,5 @@ cython_debug/
 output/
 tmp/
 results/
+
+experiments/large_tomogram_gpu_optimization_report.tex
