@@ -192,6 +192,44 @@ def _qr_score_block(
     )
 
 
+def _host_qr_score_block(
+    flattened_templates: npt.NDArray[np.complex64],
+    template_eigenvalues: npt.NDArray[np.float32],
+    noise_variance: float,
+) -> tuple[
+    npt.NDArray[np.complex64],
+    npt.NDArray[np.float32],
+    np.float32,
+    npt.NDArray[np.float64],
+]:
+    """Compute one block with host LAPACK when GPU complex QR is unavailable."""
+    orthonormal_basis, triangular_factor = np.linalg.qr(
+        flattened_templates,
+        mode="reduced",
+    )
+    signal_covariance = (
+        triangular_factor * template_eigenvalues[None, :]
+    ) @ triangular_factor.conj().T
+    signal_covariance = 0.5 * (
+        signal_covariance + signal_covariance.conj().T
+    )
+    signal_eigenvalues, covariance_eigenvectors = np.linalg.eigh(
+        signal_covariance
+    )
+    signal_eigenvalues = np.maximum(signal_eigenvalues, 0)[::-1]
+    covariance_eigenvectors = covariance_eigenvectors[:, ::-1]
+    covariance_eigenvalues = noise_variance + signal_eigenvalues
+    score_weights = 1.0 / noise_variance - 1.0 / covariance_eigenvalues
+    score_offset = np.sum(np.log(covariance_eigenvalues / noise_variance))
+    score_basis = orthonormal_basis @ covariance_eigenvectors
+    return (
+        np.asarray(score_basis.T, dtype=np.complex64),
+        np.asarray(score_weights, dtype=np.float32),
+        np.float32(score_offset),
+        np.asarray(signal_eigenvalues, dtype=np.float64),
+    )
+
+
 def distributed_block_qr_score_parameters(
     templates: npt.ArrayLike,
     template_eigenvalues: npt.ArrayLike,
@@ -201,6 +239,7 @@ def distributed_block_qr_score_parameters(
     *,
     devices: Sequence[jax.Device] | None = None,
     output: npt.NDArray[np.complex64] | None = None,
+    host_qr: bool = False,
 ) -> tuple[
     npt.NDArray[np.complex64],
     npt.NDArray[np.float32],
@@ -210,8 +249,10 @@ def distributed_block_qr_score_parameters(
     """Compute independent QR likelihood bases for every ``(ell, m)`` block.
 
     Same-width blocks are dispatched independently across the selected devices.
-    No Gram-matrix precheck is performed: block QR is the scoring definition.
-    Cross-block orthogonality follows the spherical-harmonic construction.
+    ``host_qr`` uses NumPy/LAPACK for systems whose GPU backend does not support
+    complex QR. No Gram-matrix precheck is performed: block QR is the scoring
+    definition. Cross-block orthogonality follows the spherical-harmonic
+    construction.
     """
     template_array = np.asanyarray(templates)
     eigenvalues = np.asarray(template_eigenvalues, dtype=np.float32)
@@ -251,6 +292,33 @@ def distributed_block_qr_score_parameters(
             len(blocks),
             len(selected_devices),
         )
+        if host_qr:
+            for block_index, indices in enumerate(blocks, start=1):
+                LOGGER.info(
+                    "Host block QR %d/%d for radial width=%d",
+                    block_index,
+                    len(blocks),
+                    width,
+                )
+                host_templates = np.asarray(
+                    template_array[indices],
+                    dtype=np.complex64,
+                ).reshape(width, voxel_count).T
+                basis_block, weight_block, offset, eigenvalue_block = (
+                    _host_qr_score_block(
+                        host_templates,
+                        eigenvalues[indices],
+                        float(noise_variance),
+                    )
+                )
+                score_templates[indices] = basis_block.reshape(
+                    width,
+                    *template_array.shape[1:],
+                )
+                score_weights[indices] = weight_block
+                signal_eigenvalues[indices] = eigenvalue_block
+                total_offset += float(offset)
+            continue
         compiled_qr = jax.jit(
             partial(_qr_score_block, noise_variance=float(noise_variance)),
         )
@@ -982,6 +1050,7 @@ class MultiGPUKLTParticleDetector3D:
         noise_variance: float,
         *,
         output: npt.NDArray[np.complex64] | None = None,
+        host_qr: bool = False,
     ) -> tuple[
         npt.NDArray[np.complex64],
         npt.NDArray[np.float32],
@@ -1001,6 +1070,7 @@ class MultiGPUKLTParticleDetector3D:
             noise_variance,
             devices=self.devices,
             output=output,
+            host_qr=host_qr,
         )
         (
             self.score_templates,
