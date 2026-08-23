@@ -25,6 +25,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
+from kltpicker_3d.fredholm_solver import INVERSE_FOURIER_NORMALIZATION_3D
 from kltpicker_3d.multi_gpu import MultiGPUKLTParticleDetector3D
 from kltpicker_3d.streaming import MrcVolumeSource
 
@@ -51,6 +52,7 @@ DEFAULT_RESULTS_DIR = REPOSITORY_ROOT / "results/empiar-10045-bandpass-block-qr"
 
 LOGGER = logging.getLogger("empiar-10045")
 T = TypeVar("T")
+_SCORE_MODEL_METHOD = "block_qr_ell_m_v2_fourier_normalized"
 
 
 def parse_args() -> argparse.Namespace:
@@ -879,10 +881,22 @@ def main() -> None:
             template_metadata_path = (
                 args.results_dir / "06_template_metadata.npz"
             )
+            template_checkpoint_compatible = False
+            if template_metadata_path.is_file():
+                with np.load(template_metadata_path, allow_pickle=False) as metadata:
+                    template_checkpoint_compatible = (
+                        "inverse_fourier_normalization_3d" in metadata
+                        and np.isclose(
+                            metadata["inverse_fourier_normalization_3d"].item(),
+                            INVERSE_FOURIER_NORMALIZATION_3D,
+                        )
+                    )
+            templates_recomputed = False
             if (
                 args.resume
                 and templates_path.is_file()
                 and template_metadata_path.is_file()
+                and template_checkpoint_compatible
             ):
                 LOGGER.info(
                     "STAGE RESUME | templates | loading %s",
@@ -895,10 +909,26 @@ def main() -> None:
                 )
                 elapsed = 0.0
             else:
+                if (
+                    args.resume
+                    and templates_path.is_file()
+                    and template_metadata_path.is_file()
+                    and not template_checkpoint_compatible
+                ):
+                    if not args.overwrite:
+                        raise RuntimeError(
+                            "stage-6 checkpoint uses the legacy Fourier scale; "
+                            "pass --resume --overwrite to rebuild stage 6 onward"
+                        )
+                    LOGGER.warning(
+                        "Stage-6 checkpoint predates corrected Fourier "
+                        "normalization; rebuilding templates and eigenvalues"
+                    )
                 require_replaceable(
                     (templates_path, template_metadata_path),
                     overwrite=args.overwrite,
                 )
+                templates_recomputed = True
                 detector.templates, elapsed = run_stage(
                     "6/8 Fredholm solve and KLT template construction",
                     lambda: detector.build_templates(
@@ -941,6 +971,9 @@ def main() -> None:
                         -1
                         if detector.model.max_templates is None
                         else detector.model.max_templates
+                    ),
+                    inverse_fourier_normalization_3d=np.asarray(
+                        INVERSE_FOURIER_NORMALIZATION_3D
                     ),
                 )
             record_stage_time(stage_times, "templates", elapsed)
@@ -1039,10 +1072,20 @@ def main() -> None:
 
             score_templates_path = args.results_dir / "06b_block_qr_templates.npy"
             score_model_path = args.results_dir / "06b_block_qr_score_model.npz"
+            score_checkpoint_compatible = False
+            if score_model_path.is_file():
+                with np.load(score_model_path, allow_pickle=False) as score_model:
+                    score_checkpoint_compatible = (
+                        "method" in score_model
+                        and score_model["method"].item() == _SCORE_MODEL_METHOD
+                    )
+            score_model_recomputed = False
             if (
                 args.resume
+                and not templates_recomputed
                 and score_templates_path.is_file()
                 and score_model_path.is_file()
+                and score_checkpoint_compatible
             ):
                 LOGGER.info(
                     "STAGE RESUME | (ell,m) block-QR score model | loading %s",
@@ -1054,8 +1097,6 @@ def main() -> None:
                     allow_pickle=False,
                 )
                 with np.load(score_model_path, allow_pickle=False) as score_model:
-                    if score_model["method"].item() != "block_qr_ell_m_v1":
-                        raise RuntimeError("incompatible score-model checkpoint")
                     if (
                         "noise_variance" in score_model
                         and not np.isclose(
@@ -1076,10 +1117,26 @@ def main() -> None:
                         "adjusted_template_eigenvalues"
                     ].copy()
             else:
+                if (
+                    args.resume
+                    and score_model_path.is_file()
+                    and not score_checkpoint_compatible
+                ):
+                    if not args.overwrite:
+                        raise RuntimeError(
+                            "stage-6b checkpoint uses the legacy likelihood "
+                            "scale; pass --resume --overwrite to rebuild stage "
+                            "6b onward"
+                        )
+                    LOGGER.warning(
+                        "Stage-6b checkpoint uses the legacy likelihood scale; "
+                        "rebuilding block-QR score parameters"
+                    )
                 require_replaceable(
                     (score_templates_path, score_model_path),
                     overwrite=args.overwrite,
                 )
+                score_model_recomputed = True
                 run_stage(
                     "6b/8 distributed (ell,m) block QR and score model",
                     lambda: prepare_block_qr_checkpoint(
@@ -1091,7 +1148,7 @@ def main() -> None:
                 )
                 save_npz(
                     score_model_path,
-                    method=np.asarray("block_qr_ell_m_v1"),
+                    method=np.asarray(_SCORE_MODEL_METHOD),
                     template_normalization=detector.template_normalization,
                     score_weights=detector.score_weights,
                     score_offset=np.asarray(detector.score_offset),
@@ -1109,7 +1166,12 @@ def main() -> None:
             candidate_tag = f"top{args.candidate_capacity_per_subvolume}"
             candidates_path = args.results_dir / f"07_candidates_{candidate_tag}.npy"
             score_plan_path = args.results_dir / f"07_score_plan_{candidate_tag}.json"
-            if args.resume and candidates_path.is_file():
+            candidates_recomputed = False
+            if (
+                args.resume
+                and not score_model_recomputed
+                and candidates_path.is_file()
+            ):
                 LOGGER.info(
                     "STAGE RESUME | scoring candidates | loading %s",
                     candidates_path,
@@ -1130,6 +1192,7 @@ def main() -> None:
                     ),
                 )
                 save_npy(detector.candidates, candidates_path)
+                candidates_recomputed = True
                 if detector.score_plan is not None:
                     save_json(detector.score_plan, score_plan_path)
             record_stage_time(stage_times, "scoring", elapsed)
@@ -1143,7 +1206,11 @@ def main() -> None:
             particles_path = (
                 args.results_dir / f"08_particles_{candidate_tag}_zyx.npy"
             )
-            if args.resume and particles_path.is_file():
+            if (
+                args.resume
+                and not candidates_recomputed
+                and particles_path.is_file()
+            ):
                 LOGGER.info(
                     "STAGE RESUME | global NMS | loading %s",
                     particles_path,

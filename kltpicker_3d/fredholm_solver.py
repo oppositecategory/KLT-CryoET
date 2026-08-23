@@ -7,6 +7,13 @@ import numpy.typing as npt
 from scipy.special import roots_legendre, spherical_jn
 
 
+# NumPy's inverse Fourier transform represents the continuum convention
+# C(h) = (2*pi)^-3 integral G(omega) exp(i omega.h) d omega.  The radial PSD
+# calibration uses the same convention when converting spectral mass to
+# spatial variance, so every covariance integral must carry this factor.
+INVERSE_FOURIER_NORMALIZATION_3D = (2 * np.pi) ** -3
+
+
 def _build_radial_fredholm_matrices(
     Gx: npt.ArrayLike,
     N: int,
@@ -60,7 +67,13 @@ def _build_radial_fredholm_matrices(
         * spherical_jn(N, radial_frequency_grid),
         dtype=np.complex128,
     )
-    frequency_measure = (c / 2) * legendre_weights * radial_psd * frequency_nodes**2
+    frequency_measure = (
+        INVERSE_FOURIER_NORMALIZATION_3D
+        * (c / 2)
+        * legendre_weights
+        * radial_psd
+        * frequency_nodes**2
+    )
     kernel = (basis * frequency_measure[None, :]) @ np.conj(basis).T
     kernel = (kernel + kernel.conj().T) / 2
 

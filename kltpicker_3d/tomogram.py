@@ -12,6 +12,7 @@ from kltpicker_3d.alt_least_squares import (
     alternating_least_squares_solver,
 )
 from kltpicker_3d.fredholm_solver import (
+    INVERSE_FOURIER_NORMALIZATION_3D,
     solve_radial_fredholm_equation,
 )
 from kltpicker_3d.spectral_estimation import (
@@ -598,7 +599,12 @@ class KLTParticleDetector3D:
             1,
         )
         frequency_weights = (
-            bandlimit / 2 * legendre_weights * particle_psd_nodes * frequency_nodes**2
+            INVERSE_FOURIER_NORMALIZATION_3D
+            * bandlimit
+            / 2
+            * legendre_weights
+            * particle_psd_nodes
+            * frequency_nodes**2
         )
         spatial_weights = support_radius / 2 * legendre_weights * spatial_nodes**2
         right_basis = parity_sign[:, None, None] * quadrature_bases
