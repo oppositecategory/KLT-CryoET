@@ -341,12 +341,53 @@ def test_global_candidate_nms_is_independent_of_device_completion_order():
     assert_array_equal(shuffled, expected)
 
 
+def test_spatial_hash_nms_matches_quadratic_reference():
+    rng = np.random.default_rng(18)
+    candidates = np.column_stack(
+        (
+            rng.integers(0, 40, size=(300, 3)),
+            rng.standard_normal(300),
+        )
+    ).astype(np.float64)
+
+    def quadratic(radius: float, max_picks: int) -> np.ndarray:
+        order = np.lexsort(
+            (
+                candidates[:, 2],
+                candidates[:, 1],
+                candidates[:, 0],
+                -candidates[:, 3],
+            )
+        )
+        accepted = []
+        for candidate in candidates[order]:
+            if accepted:
+                differences = np.asarray(accepted)[:, :3] - candidate[:3]
+                if np.any(np.sum(differences**2, axis=1) <= radius**2):
+                    continue
+            accepted.append(candidate)
+            if len(accepted) == max_picks:
+                break
+        return np.asarray(accepted)
+
+    for radius in (0, 1, 3.5, 8):
+        for max_picks in (1, 20, len(candidates)):
+            assert_array_equal(
+                ranked_candidate_nms_3d(
+                    candidates,
+                    radius=radius,
+                    max_picks=max_picks,
+                ),
+                quadratic(radius, max_picks),
+            )
+
+
 def test_streamed_candidates_match_complete_volume_scoring():
     rng = np.random.default_rng(91)
     volume = rng.standard_normal((13, 14, 15)).astype(np.float32)
     whitening_filter = np.ones((3, 3, 3), dtype=np.float32) / 27
-    templates = rng.standard_normal((2, 3, 3, 3)).astype(np.float32)
-    template_eigenvalues = np.array([2.0, 0.75], dtype=np.float32)
+    templates = rng.standard_normal((7, 3, 3, 3)).astype(np.float32)
+    template_eigenvalues = np.linspace(2.0, 0.5, 7, dtype=np.float32)
     noise_variance = 0.8
 
     detector = MultiGPUKLTParticleDetector3D(
@@ -363,10 +404,11 @@ def test_streamed_candidates_match_complete_volume_scoring():
         psd_patch_size=3,
         fredholm_radius=1,
         template_side=3,
+        score_template_chunk_size=1,
     )
     detector.model.eigvals = template_eigenvalues
-    detector.model.template_orders = np.zeros(2, dtype=np.int64)
-    detector.model.template_m_values = np.zeros(2, dtype=np.int64)
+    detector.model.template_orders = np.zeros(7, dtype=np.int64)
+    detector.model.template_m_values = np.zeros(7, dtype=np.int64)
     kernels, weights, offset, _ = detector.prepare_score_filters(
         templates,
         noise_variance,

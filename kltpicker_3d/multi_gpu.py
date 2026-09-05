@@ -651,15 +651,62 @@ def compute_fused_klt_score_shard(
     loaded_shape = tuple(int(size) for size in loaded_subvolume.shape)
     fft_shape = plan_cufft_fft_shape(loaded_shape, fft_shape)
     output_shape = tuple(size + 2 * score_halo for size in core_shape)
-    crop_start = whitening_radius + template_radius
+    whitened_spectrum = prepare_whitened_subvolume_spectrum(
+        loaded_subvolume,
+        whitening_filter,
+        fft_shape=fft_shape,
+    )
+    initial_score = jnp.zeros(output_shape, dtype=jnp.float32)
+    partial_score = accumulate_klt_template_chunk(
+        whitened_spectrum,
+        initial_score,
+        local_templates,
+        local_normalization,
+        local_weights,
+        template_radius=template_radius,
+        whitening_radius=whitening_radius,
+        template_batch_size=template_batch_size,
+    )
+    score = (
+        partial_score
+        if axis_name is None
+        else jax.lax.psum(partial_score, axis_name)
+    )
+    return score - score_offset
 
+
+def prepare_whitened_subvolume_spectrum(
+    loaded_subvolume: jax.Array,
+    whitening_filter: jax.Array,
+    *,
+    fft_shape: tuple[int, int, int],
+) -> jax.Array:
+    """Transform and whiten one haloed subvolume on a static FFT grid."""
     volume_spectrum = jnp.fft.fftn(loaded_subvolume, s=fft_shape)
     whitening_spectrum = _centered_filter_spectrum(
         whitening_filter,
         fft_shape,
     )[0]
-    whitened_spectrum = volume_spectrum * whitening_spectrum
-    initial_score = jnp.zeros(output_shape, dtype=jnp.float32)
+    return volume_spectrum * whitening_spectrum
+
+
+def accumulate_klt_template_chunk(
+    whitened_spectrum: jax.Array,
+    partial_score: jax.Array,
+    local_templates: jax.Array,
+    local_normalization: jax.Array,
+    local_weights: jax.Array,
+    *,
+    whitening_radius: int,
+    template_radius: int,
+    template_batch_size: int,
+) -> jax.Array:
+    """Accumulate one fixed-size compact-template chunk into a local score."""
+    if local_templates.shape[0] % template_batch_size:
+        raise ValueError("local template chunk must contain complete batches")
+    fft_shape = tuple(int(size) for size in whitened_spectrum.shape)
+    output_shape = tuple(int(size) for size in partial_score.shape)
+    crop_start = whitening_radius + template_radius
     batch_count = local_templates.shape[0] // template_batch_size
 
     def accumulate(batch_index: jax.Array, score: jax.Array) -> jax.Array:
@@ -706,18 +753,51 @@ def compute_fused_klt_score_shard(
             axis=0,
         )
 
-    partial_score = jax.lax.fori_loop(
+    return jax.lax.fori_loop(
         0,
         batch_count,
         accumulate,
-        initial_score,
+        partial_score,
     )
-    score = (
-        partial_score
-        if axis_name is None
-        else jax.lax.psum(partial_score, axis_name)
+
+
+def finalize_klt_score_shards_and_extract_candidates(
+    partial_score: jax.Array,
+    region_start: jax.Array,
+    score_offset: jax.Array,
+    *,
+    core_shape: tuple[int, int, int],
+    source_shape: tuple[int, int, int],
+    template_radius: int,
+    candidate_capacity: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Reduce completed template shards and extract candidates on device zero."""
+    haloed_scores = jax.lax.psum(partial_score, _TEMPLATE_AXIS_NAME)
+    haloed_scores = haloed_scores - score_offset
+
+    def extract(_: None) -> tuple[jax.Array, jax.Array, jax.Array]:
+        return extract_score_candidates(
+            haloed_scores,
+            region_start,
+            core_shape=core_shape,
+            source_shape=source_shape,
+            template_radius=template_radius,
+            candidate_capacity=candidate_capacity,
+        )
+
+    def empty(_: None) -> tuple[jax.Array, jax.Array, jax.Array]:
+        return (
+            jnp.zeros((candidate_capacity, 3), dtype=jnp.int32),
+            jnp.full((candidate_capacity,), -jnp.inf, dtype=jnp.float32),
+            jnp.asarray(0, dtype=jnp.int32),
+        )
+
+    return jax.lax.cond(
+        jax.lax.axis_index(_TEMPLATE_AXIS_NAME) == 0,
+        extract,
+        empty,
+        operand=None,
     )
-    return score - score_offset
 
 
 def extract_score_candidates(
@@ -922,15 +1002,39 @@ def ranked_candidate_nms_3d(
     accepted = np.empty((min(max_picks, ranked.shape[0]), 4), dtype=np.float64)
     accepted_count = 0
     radius_squared = radius**2
+    cells: dict[tuple[int | float, int | float, int | float], list[int]] = {}
     for candidate in ranked:
-        if accepted_count:
-            distances_squared = np.sum(
-                (accepted[:accepted_count, :3] - candidate[:3]) ** 2,
-                axis=1,
-            )
-            if np.any(distances_squared <= radius_squared):
-                continue
+        if radius:
+            cell = tuple(np.floor(candidate[:3] / radius).astype(np.int64))
+            neighbor_offsets = (-1, 0, 1)
+        else:
+            cell = tuple(candidate[:3])
+            neighbor_offsets = (0,)
+        reject = False
+        for dz in neighbor_offsets:
+            for dy in neighbor_offsets:
+                for dx in neighbor_offsets:
+                    neighbor = (cell[0] + dz, cell[1] + dy, cell[2] + dx)
+                    neighbor_indices = cells.get(neighbor)
+                    if neighbor_indices is None:
+                        continue
+                    differences = (
+                        accepted[neighbor_indices, :3] - candidate[:3]
+                    )
+                    if np.any(
+                        np.sum(differences * differences, axis=1)
+                        <= radius_squared
+                    ):
+                        reject = True
+                        break
+                if reject:
+                    break
+            if reject:
+                break
+        if reject:
+            continue
         accepted[accepted_count] = candidate
+        cells.setdefault(cell, []).append(accepted_count)
         accepted_count += 1
         if accepted_count == accepted.shape[0]:
             break
@@ -968,6 +1072,7 @@ class MultiGPUKLTParticleDetector3D:
         template_side: int | None = None,
         nms_radius: float | None = None,
         score_template_batch_size: int | None = None,
+        score_template_chunk_size: int | None = None,
         score_memory_fraction: float = _DEFAULT_SCORE_MEMORY_FRACTION,
         score_fft_shape: tuple[int, int, int] | None = None,
         boundary_mode: PaddingMode = "constant",
@@ -990,6 +1095,8 @@ class MultiGPUKLTParticleDetector3D:
             raise ValueError("candidate capacity must be positive")
         if score_template_batch_size is not None and score_template_batch_size < 1:
             raise ValueError("score_template_batch_size must be positive")
+        if score_template_chunk_size is not None and score_template_chunk_size < 1:
+            raise ValueError("score_template_chunk_size must be positive")
         if not 0 < score_memory_fraction <= 1:
             raise ValueError("score_memory_fraction must lie in (0, 1]")
         if score_fft_shape is not None and (
@@ -1066,6 +1173,7 @@ class MultiGPUKLTParticleDetector3D:
         self.candidate_capacity_per_subvolume = candidate_capacity_per_subvolume
         self.device_memory_bytes = memory_limit
         self.score_template_batch_size = score_template_batch_size
+        self.score_template_chunk_size = score_template_chunk_size
         self.score_memory_fraction = score_memory_fraction
         self.score_fft_shape = (
             None
@@ -1265,6 +1373,24 @@ class MultiGPUKLTParticleDetector3D:
         templates_per_device = (
             templates.shape[0] + device_count - 1
         ) // device_count
+        if (
+            self.score_template_chunk_size is not None
+            and self.score_template_chunk_size < templates_per_device
+        ):
+            return self._score_candidates_with_streamed_template_chunks(
+                templates,
+                normalization,
+                score_weights,
+                score_offset,
+                whitening_filter,
+                whitening_radius=whitening_radius,
+                template_radius=template_radius,
+                total_halo=total_halo,
+                loaded_shape=loaded_shape,
+                fft_shape=fft_shape,
+                candidate_capacity=candidate_capacity,
+                templates_per_device=templates_per_device,
+            )
         batch_size = self.score_template_batch_size
         if batch_size is None:
             if self.device_memory_bytes is None:
@@ -1481,6 +1607,214 @@ class MultiGPUKLTParticleDetector3D:
             truncated_subvolumes,
             self.processor.subvolume_count,
         )
+        return np.asarray(np.concatenate(candidate_blocks), dtype=np.float64)
+
+    def _score_candidates_with_streamed_template_chunks(
+        self,
+        templates: npt.NDArray[np.generic],
+        normalization: npt.NDArray[np.float32],
+        score_weights: npt.NDArray[np.float32],
+        score_offset: np.float32,
+        whitening_filter: npt.NDArray[np.float32],
+        *,
+        whitening_radius: int,
+        template_radius: int,
+        total_halo: int,
+        loaded_shape: tuple[int, int, int],
+        fft_shape: tuple[int, int, int],
+        candidate_capacity: int,
+        templates_per_device: int,
+    ) -> npt.NDArray[np.float64]:
+        """Score while retaining only one compact-template chunk per GPU."""
+        device_count = len(self.devices)
+        batch_size = self.score_template_batch_size or 1
+        chunk_size = min(self.score_template_chunk_size, templates_per_device)
+        chunk_size = max(batch_size, chunk_size // batch_size * batch_size)
+        chunk_count = (templates_per_device + chunk_size - 1) // chunk_size
+        output_shape = tuple(
+            size + 2 * _LOCAL_MAXIMUM_RADIUS
+            for size in self.processor.core_shape
+        )
+        if self.device_memory_bytes is None:
+            capacity_plan = {"memory_fraction": self.score_memory_fraction}
+        else:
+            capacity_plan = plan_template_fft_batch(
+                loaded_shape,
+                self.processor.core_shape,
+                tuple(int(size) for size in templates.shape[1:]),
+                chunk_size,
+                self.device_memory_bytes,
+                memory_fraction=self.score_memory_fraction,
+                fft_shape=fft_shape,
+            )
+            if int(capacity_plan["batch_size"]) < batch_size:
+                raise ValueError(
+                    "template batch exceeds streamed scoring memory capacity"
+                )
+        capacity_plan.update(
+            {
+                "batch_size": batch_size,
+                "template_chunk_size_per_device": chunk_size,
+                "template_chunk_count": chunk_count,
+                "templates_per_device": templates_per_device,
+                "template_count": int(templates.shape[0]),
+                "subvolume_count": self.processor.subvolume_count,
+            }
+        )
+        self.score_plan = capacity_plan
+        LOGGER.info(
+            "Streamed KLT scoring: templates=%d | local=%d | chunk=%d | "
+            "chunks/subvolume=%d | batch=%d | FFT=%s | subvolumes=%d",
+            templates.shape[0],
+            templates_per_device,
+            chunk_size,
+            chunk_count,
+            batch_size,
+            fft_shape,
+            self.processor.subvolume_count,
+        )
+
+        prepare = jax.pmap(
+            partial(
+                prepare_whitened_subvolume_spectrum,
+                fft_shape=fft_shape,
+            ),
+            in_axes=(0, None),
+            devices=self.devices,
+        )
+        accumulate = jax.pmap(
+            partial(
+                accumulate_klt_template_chunk,
+                whitening_radius=whitening_radius,
+                template_radius=template_radius,
+                template_batch_size=batch_size,
+            ),
+            in_axes=(0, 0, 0, 0, 0),
+            devices=self.devices,
+        )
+        finalize = jax.pmap(
+            partial(
+                finalize_klt_score_shards_and_extract_candidates,
+                core_shape=self.processor.core_shape,
+                source_shape=self.source.shape,
+                template_radius=template_radius,
+                candidate_capacity=candidate_capacity,
+            ),
+            axis_name=_TEMPLATE_AXIS_NAME,
+            in_axes=(0, None, None),
+            devices=self.devices,
+        )
+        zero_scores = [np.zeros(output_shape, dtype=np.float32)] * device_count
+        candidate_blocks = []
+        total_local_maxima = 0
+        retained_local_maxima = 0
+        truncated_subvolumes = 0
+        valid_lower = np.full(3, template_radius)
+        valid_upper = np.asarray(self.source.shape) - template_radius
+
+        for region in tqdm(
+            self.processor.regions(),
+            total=self.processor.subvolume_count,
+            desc="Chunk-streamed KLT scoring",
+            unit="subvolume",
+        ):
+            loaded = self.processor.load_region(region, total_halo)
+            device_loaded = jax.device_put_replicated(loaded, self.devices)
+            device_spectra = prepare(device_loaded, whitening_filter)
+            device_scores = jax.device_put_sharded(zero_scores, self.devices)
+            for chunk_index in range(chunk_count):
+                local_start = chunk_index * chunk_size
+                template_shards = []
+                normalization_shards = []
+                weight_shards = []
+                for device_index in range(device_count):
+                    global_start = (
+                        device_index * templates_per_device + local_start
+                    )
+                    global_stop = min(
+                        global_start + chunk_size,
+                        (device_index + 1) * templates_per_device,
+                        templates.shape[0],
+                    )
+                    count = max(0, global_stop - global_start)
+                    if count == chunk_size:
+                        # A full memmap slice is already contiguous and has the
+                        # transfer dtype. Avoid copying every multi-GiB chunk
+                        # through a second pageable host buffer.
+                        template_shard = np.asarray(
+                            templates[global_start:global_stop],
+                            dtype=np.complex64,
+                        )
+                        norm_shard = np.asarray(
+                            normalization[global_start:global_stop],
+                            dtype=np.float32,
+                        )
+                        weight_shard = np.asarray(
+                            score_weights[global_start:global_stop],
+                            dtype=np.float32,
+                        )
+                    else:
+                        template_shard = np.zeros(
+                            (chunk_size, *templates.shape[1:]),
+                            dtype=np.complex64,
+                        )
+                        norm_shard = np.zeros(chunk_size, dtype=np.float32)
+                        weight_shard = np.zeros(chunk_size, dtype=np.float32)
+                        if count:
+                            template_shard[:count] = templates[
+                                global_start:global_stop
+                            ]
+                            norm_shard[:count] = normalization[
+                                global_start:global_stop
+                            ]
+                            weight_shard[:count] = score_weights[
+                                global_start:global_stop
+                            ]
+                    template_shards.append(template_shard)
+                    normalization_shards.append(norm_shard)
+                    weight_shards.append(weight_shard)
+                device_scores = accumulate(
+                    device_spectra,
+                    device_scores,
+                    jax.device_put_sharded(template_shards, self.devices),
+                    jax.device_put_sharded(normalization_shards, self.devices),
+                    jax.device_put_sharded(weight_shards, self.devices),
+                )
+                device_scores.block_until_ready()
+            output = finalize(
+                device_scores,
+                np.asarray(region.start, dtype=np.int32),
+                score_offset,
+            )
+            local_coordinates, local_scores, local_counts = (
+                np.asarray(output_leaf[0]) for output_leaf in output
+            )
+            candidate_count = int(local_counts)
+            retained = min(candidate_count, candidate_capacity)
+            total_local_maxima += candidate_count
+            retained_local_maxima += retained
+            truncated_subvolumes += int(candidate_count > candidate_capacity)
+            coordinates = local_coordinates[:retained] + np.asarray(region.start)
+            scores = local_scores[:retained]
+            inside = np.all(
+                (coordinates >= valid_lower) & (coordinates < valid_upper),
+                axis=1,
+            )
+            if np.any(inside):
+                candidate_blocks.append(
+                    np.column_stack((coordinates[inside], scores[inside]))
+                )
+        LOGGER.info(
+            "Local-max retention: retained=%d / found=%d | top-K=%d | "
+            "truncated subvolumes=%d/%d",
+            retained_local_maxima,
+            total_local_maxima,
+            candidate_capacity,
+            truncated_subvolumes,
+            self.processor.subvolume_count,
+        )
+        if not candidate_blocks:
+            return np.empty((0, 4), dtype=np.float64)
         return np.asarray(np.concatenate(candidate_blocks), dtype=np.float64)
 
     def non_maximum_suppression(

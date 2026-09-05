@@ -39,6 +39,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from kltpicker_3d.multi_gpu import (
     _TEMPLATE_AXIS_NAME,
+    plan_cufft_fft_shape,
     score_template_shards_and_extract_candidates,
 )
 from kltpicker_3d.streaming import (
@@ -374,6 +375,7 @@ def compile_distributed_score(
     template_radius: int,
     candidate_capacity: int,
     batch_size: int,
+    fft_shape: tuple[int, int, int],
 ) -> Any:
     """Construct the production template-sharded pmap scoring callable."""
     configured = partial(
@@ -384,6 +386,7 @@ def compile_distributed_score(
         template_radius=template_radius,
         candidate_capacity=candidate_capacity,
         template_batch_size=batch_size,
+        fft_shape=fft_shape,
     )
     return jax.pmap(
         configured,
@@ -497,6 +500,8 @@ def main() -> None:
         args.batch_size, results_dir, templates_per_device
     )
     total_halo = whitening_radius + template_radius + 1
+    loaded_shape = tuple(size + 2 * total_halo for size in core_shape)
+    fft_shape = plan_cufft_fft_shape(loaded_shape)
     candidate_capacity = min(args.candidate_capacity, int(np.prod(core_shape)))
 
     LOGGER.info("JAX %s | devices=%d", jax.__version__, len(devices))
@@ -504,10 +509,11 @@ def main() -> None:
         LOGGER.info("Device %d: %s", index, device.device_kind)
     LOGGER.info("Input: %s", input_path)
     LOGGER.info(
-        "Geometry: core=%s | halo=%d | loaded=%s | template=%s",
+        "Geometry: core=%s | halo=%d | loaded=%s | FFT=%s | template=%s",
         core_shape,
         total_halo,
-        tuple(size + 2 * total_halo for size in core_shape),
+        loaded_shape,
+        fft_shape,
         templates.shape[1:],
     )
     LOGGER.info(
@@ -585,6 +591,7 @@ def main() -> None:
             template_radius=template_radius,
             candidate_capacity=candidate_capacity,
             batch_size=batch_size,
+            fft_shape=fft_shape,
         )
         region_start = np.asarray(region.start, dtype=np.int32)
 
@@ -684,6 +691,7 @@ def main() -> None:
         "score_model_method": method,
         "core_shape": core_shape,
         "loaded_shape": loaded_subvolume.shape,
+        "fft_shape": fft_shape,
         "whitening_radius": whitening_radius,
         "template_radius": template_radius,
         "total_halo": total_halo,

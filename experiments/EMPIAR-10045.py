@@ -26,7 +26,10 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from kltpicker_3d.fredholm_solver import INVERSE_FOURIER_NORMALIZATION_3D
-from kltpicker_3d.multi_gpu import MultiGPUKLTParticleDetector3D
+from kltpicker_3d.multi_gpu import (
+    MultiGPUKLTParticleDetector3D,
+    ranked_candidate_nms_3d,
+)
 from kltpicker_3d.streaming import MrcVolumeSource
 
 # DATASET_ROOT = Path(
@@ -123,6 +126,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--template-energy-fraction", type=float, default=0.99)
     parser.add_argument("--max-templates", type=int, default=1000)
+    parser.add_argument(
+        "--skip-raw-template-checkpoint",
+        action="store_true",
+        help=(
+            "Keep the pre-QR template bank only in host RAM and checkpoint "
+            "only its metadata and the final block-QR bank. This avoids "
+            "temporarily requiring disk space for two large template banks."
+        ),
+    )
     parser.add_argument("--max-iterations", type=int, default=500)
     parser.add_argument(
         "--threshold",
@@ -134,6 +146,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--template-side", type=int)
     parser.add_argument("--nms-radius", type=float)
     parser.add_argument("--score-template-batch-size", type=int)
+    parser.add_argument(
+        "--score-template-chunk-size",
+        type=int,
+        help="Compact templates resident per GPU while streaming score shards.",
+    )
     parser.add_argument("--score-memory-fraction", type=float, default=0.8)
     parser.add_argument(
         "--score-fft-shape",
@@ -722,6 +739,7 @@ def main() -> None:
                 template_side=args.template_side,
                 nms_radius=args.nms_radius,
                 score_template_batch_size=args.score_template_batch_size,
+                score_template_chunk_size=args.score_template_chunk_size,
                 score_memory_fraction=args.score_memory_fraction,
                 score_fft_shape=(
                     None
@@ -755,7 +773,11 @@ def main() -> None:
                 "max_order": detector.model.max_order,
                 "template_energy_fraction": args.template_energy_fraction,
                 "max_templates": args.max_templates,
+                "raw_template_checkpoint": (
+                    not args.skip_raw_template_checkpoint
+                ),
                 "score_template_batch_size": args.score_template_batch_size,
+                "score_template_chunk_size": args.score_template_chunk_size,
                 "score_memory_fraction": args.score_memory_fraction,
                 "score_fft_shape": detector.score_fft_shape,
                 "nms_radius_voxels": detector.model.nms_radius_voxels,
@@ -899,6 +921,8 @@ def main() -> None:
             template_metadata_path = (
                 args.results_dir / "06_template_metadata.npz"
             )
+            score_templates_path = args.results_dir / "06b_block_qr_templates.npy"
+            score_model_path = args.results_dir / "06b_block_qr_score_model.npz"
             template_checkpoint_compatible = False
             if template_metadata_path.is_file():
                 with np.load(template_metadata_path, allow_pickle=False) as metadata:
@@ -909,22 +933,43 @@ def main() -> None:
                             INVERSE_FOURIER_NORMALIZATION_3D,
                         )
                     )
+            score_checkpoint_compatible = False
+            if score_model_path.is_file():
+                with np.load(score_model_path, allow_pickle=False) as score_model:
+                    score_checkpoint_compatible = (
+                        "method" in score_model
+                        and score_model["method"].item() == _SCORE_MODEL_METHOD
+                        and "score_multiplicities" in score_model
+                        and "score_template_indices" in score_model
+                    )
+            complete_score_checkpoint = (
+                score_templates_path.is_file()
+                and score_model_path.is_file()
+                and score_checkpoint_compatible
+            )
             templates_recomputed = False
             if (
                 args.resume
-                and templates_path.is_file()
                 and template_metadata_path.is_file()
                 and template_checkpoint_compatible
+                and (templates_path.is_file() or complete_score_checkpoint)
             ):
-                LOGGER.info(
-                    "STAGE RESUME | templates | loading %s",
-                    templates_path,
-                )
-                detector.templates = np.load(
-                    templates_path,
-                    mmap_mode="r",
-                    allow_pickle=False,
-                )
+                if templates_path.is_file():
+                    LOGGER.info(
+                        "STAGE RESUME | templates | loading %s",
+                        templates_path,
+                    )
+                    detector.templates = np.load(
+                        templates_path,
+                        mmap_mode="r",
+                        allow_pickle=False,
+                    )
+                else:
+                    LOGGER.info(
+                        "STAGE RESUME | raw templates omitted; loading stage-6 "
+                        "metadata and the completed stage-6b score bank"
+                    )
+                    detector.templates = None
                 elapsed = 0.0
             else:
                 if (
@@ -953,12 +998,19 @@ def main() -> None:
                         detector.whitened_model.particle_psd
                     ),
                 )
-                save_npy(detector.templates, templates_path)
-                detector.templates = np.load(
-                    templates_path,
-                    mmap_mode="r",
-                    allow_pickle=False,
-                )
+                if args.skip_raw_template_checkpoint:
+                    LOGGER.info(
+                        "Raw template checkpoint omitted; retaining %.2f GiB "
+                        "in host RAM until block QR completes",
+                        detector.templates.nbytes / 2**30,
+                    )
+                else:
+                    save_npy(detector.templates, templates_path)
+                    detector.templates = np.load(
+                        templates_path,
+                        mmap_mode="r",
+                        allow_pickle=False,
+                    )
                 save_npz(
                     template_metadata_path,
                     template_eigenvalues=detector.model.eigvals,
@@ -1039,7 +1091,11 @@ def main() -> None:
                 ):
                     if name in metadata:
                         setattr(detector.model, name, metadata[name].item())
-            if detector.model.eigvals.shape != (detector.templates.shape[0],):
+            if (
+                detector.templates is not None
+                and detector.model.eigvals.shape
+                != (detector.templates.shape[0],)
+            ):
                 raise RuntimeError(
                     "template checkpoint metadata does not match the template "
                     "array; rerun stage 6 with --overwrite"
@@ -1051,7 +1107,7 @@ def main() -> None:
                 )
             if (
                 detector.model.max_templates is not None
-                and detector.templates.shape[0] > detector.model.max_templates
+                and detector.model.eigvals.shape[0] > detector.model.max_templates
             ):
                 raise RuntimeError(
                     "template checkpoint exceeds the current --max-templates; "
@@ -1091,13 +1147,18 @@ def main() -> None:
                         "template checkpoint uses a different template cap; "
                         "rerun stage 6 with --overwrite"
                     )
-            log_array("KLT templates", detector.templates)
+            if detector.templates is not None:
+                log_array("KLT templates", detector.templates)
+                template_spatial_shape = detector.templates.shape[1:]
+            else:
+                template_spatial_shape = (detector.template_side,) * 3
+                LOGGER.info("KLT raw templates: omitted after completed block QR")
             log_array("Template eigenvalues", detector.model.eigvals)
             LOGGER.info(
                 "Templates: stored m>=0 representatives=%d | effective complete "
                 "modes=%s | radial modes=%s | available complete=%s | "
                 "retained energy=%s | spatial shape=%s",
-                detector.templates.shape[0],
+                detector.model.eigvals.shape[0],
                 detector.model.retained_template_count,
                 detector.model.retained_radial_mode_count,
                 detector.model.available_template_count,
@@ -1106,20 +1167,9 @@ def main() -> None:
                     if detector.model.retained_template_energy_fraction is None
                     else f"{detector.model.retained_template_energy_fraction:.6f}"
                 ),
-                detector.templates.shape[1:],
+                template_spatial_shape,
             )
 
-            score_templates_path = args.results_dir / "06b_block_qr_templates.npy"
-            score_model_path = args.results_dir / "06b_block_qr_score_model.npz"
-            score_checkpoint_compatible = False
-            if score_model_path.is_file():
-                with np.load(score_model_path, allow_pickle=False) as score_model:
-                    score_checkpoint_compatible = (
-                        "method" in score_model
-                        and score_model["method"].item() == _SCORE_MODEL_METHOD
-                        and "score_multiplicities" in score_model
-                        and "score_template_indices" in score_model
-                    )
             score_model_recomputed = False
             if (
                 args.resume
@@ -1164,6 +1214,12 @@ def main() -> None:
                         "score_template_indices"
                     ].copy()
             else:
+                if detector.templates is None:
+                    raise RuntimeError(
+                        "raw templates are unavailable and the block-QR "
+                        "checkpoint is incomplete; rerun stage 6 with "
+                        "--overwrite"
+                    )
                 if (
                     args.resume
                     and score_model_path.is_file()
@@ -1208,6 +1264,9 @@ def main() -> None:
                         detector.whitened_model.noise_variance
                     ),
                 )
+            if args.skip_raw_template_checkpoint and detector.templates is not None:
+                detector.templates = None
+                LOGGER.info("Released raw pre-QR template bank from host RAM")
             log_array("KLT score weights", detector.score_weights)
             LOGGER.info("Block-QR score templates: %s", score_templates_path)
             LOGGER.info(
@@ -1297,11 +1356,67 @@ def main() -> None:
                 truth_count,
             )
 
-        evaluation, matches = evaluate_recall(
+            positive_candidates = detector.candidates[
+                np.isfinite(detector.candidates[:, 3])
+                & (detector.candidates[:, 3] > 0)
+            ]
+            positive_particles_path = (
+                args.results_dir
+                / f"08_positive_particles_{candidate_tag}_zyx.npy"
+            )
+            if (
+                args.resume
+                and not candidates_recomputed
+                and positive_particles_path.is_file()
+            ):
+                LOGGER.info(
+                    "STAGE RESUME | positive-score global NMS | loading %s",
+                    positive_particles_path,
+                )
+                positive_particles = np.load(
+                    positive_particles_path,
+                    allow_pickle=False,
+                )
+            else:
+                require_replaceable(
+                    (positive_particles_path,),
+                    overwrite=args.overwrite,
+                )
+                positive_particles, elapsed = run_stage(
+                    "8b/8 global NMS over every positive-score candidate",
+                    lambda: ranked_candidate_nms_3d(
+                        positive_candidates,
+                        radius=detector.model.nms_radius_voxels,
+                        max_picks=len(positive_candidates),
+                    ),
+                )
+                save_npy(positive_particles, positive_particles_path)
+                record_stage_time(stage_times, "positive_score_global_nms", elapsed)
+            save_csv(
+                positive_particles[:, [2, 1, 0, 3]],
+                args.results_dir / "08_positive_particles_xyz.csv",
+                header="x,y,z,raw_score",
+            )
+            LOGGER.info(
+                "Positive-score selection: raw candidates=%d | after NMS=%d",
+                len(positive_candidates),
+                len(positive_particles),
+            )
+
+        top_n_evaluation, top_n_matches = evaluate_recall(
             detector.particles,
             truth_zyx,
             match_radius_voxels,
         )
+        evaluation, matches = evaluate_recall(
+            positive_particles,
+            truth_zyx,
+            match_radius_voxels,
+        )
+        evaluation["selection"] = "all_positive_scores_after_global_nms"
+        evaluation["raw_positive_candidate_count"] = len(positive_candidates)
+        evaluation["requested_pick_count"] = None
+        evaluation["top_n_reference"] = top_n_evaluation
         evaluation["match_radius_angstrom"] = float(match_radius_angstrom)
         evaluation["total_runtime_minutes"] = (
             time.perf_counter() - started
@@ -1316,21 +1431,40 @@ def main() -> None:
                 "truth_z,truth_y,truth_x,distance_voxels"
             ),
         )
+        save_csv(
+            top_n_matches,
+            args.results_dir / "09_top_n_matches.csv",
+            header=(
+                "prediction_index,truth_index,pred_z,pred_y,pred_x,"
+                "truth_z,truth_y,truth_x,distance_voxels"
+            ),
+        )
         save_pickle(
             {
                 "particles_zyx_score": detector.particles,
+                "positive_particles_zyx_score": positive_particles,
                 "ground_truth_zyx": truth_zyx,
                 "matches": matches,
+                "top_n_matches": top_n_matches,
                 "evaluation": evaluation,
             },
             args.results_dir / "09_final_result.pkl",
         )
         LOGGER.info("=" * 72)
         LOGGER.info(
-            "FINAL RECALL | matched=%d / truth=%d | recall=%.4f",
+            "FINAL POSITIVE-SCORE RECALL | picks=%d | matched=%d / truth=%d | "
+            "recall=%.4f",
+            evaluation["returned_pick_count"],
             evaluation["matched_ground_truth_count"],
             evaluation["ground_truth_count"],
             evaluation["recall"],
+        )
+        LOGGER.info(
+            "TOP-%d REFERENCE RECALL | matched=%d / truth=%d | recall=%.4f",
+            truth_count,
+            top_n_evaluation["matched_ground_truth_count"],
+            top_n_evaluation["ground_truth_count"],
+            top_n_evaluation["recall"],
         )
         LOGGER.info(
             "Coordinates: %s",
