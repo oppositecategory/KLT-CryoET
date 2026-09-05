@@ -47,6 +47,51 @@ _SCORE_BATCH_COMPLEX_ARRAYS = 8
 LOGGER = logging.getLogger(__name__)
 
 
+def next_cufft_fast_length(target: int) -> int:
+    """Return the smallest cuFFT-friendly length greater than ``target``.
+
+    NVIDIA recommends transform dimensions whose prime factors are drawn from
+    2, 3, 5, and 7. This host-only planner deliberately does not depend on a
+    particular SciPy/pocketfft version.
+    """
+    if isinstance(target, bool) or not isinstance(target, (int, np.integer)):
+        raise TypeError("FFT target length must be an integer")
+    target = int(target)
+    if target < 1:
+        raise ValueError("FFT target length must be positive")
+
+    candidate = target
+    while True:
+        remainder = candidate
+        for factor in (2, 3, 5, 7):
+            while remainder % factor == 0:
+                remainder //= factor
+        if remainder == 1:
+            return candidate
+        candidate += 1
+
+
+def plan_cufft_fft_shape(
+    required_shape: tuple[int, int, int],
+    override: tuple[int, int, int] | None = None,
+) -> tuple[int, int, int]:
+    """Plan a static FFT shape on the host, optionally honoring an override."""
+    if len(required_shape) != 3 or any(size < 1 for size in required_shape):
+        raise ValueError("required FFT shape must contain three positive values")
+    required_shape = tuple(int(size) for size in required_shape)
+    if override is None:
+        return tuple(next_cufft_fast_length(size) for size in required_shape)
+    if len(override) != 3 or any(size < 1 for size in override):
+        raise ValueError("FFT shape override must contain three positive values")
+    override = tuple(int(size) for size in override)
+    if any(
+        planned < required
+        for planned, required in zip(override, required_shape, strict=True)
+    ):
+        raise ValueError("FFT shape override cannot be smaller than the loaded shape")
+    return override
+
+
 @dataclass(frozen=True)
 class CalibratedRpsdModel:
     """ALS particle/noise spectra calibrated to streamed patch variances."""
@@ -453,6 +498,7 @@ def plan_template_fft_batch(
     device_memory_bytes: int,
     *,
     memory_fraction: float = _DEFAULT_SCORE_MEMORY_FRACTION,
+    fft_shape: tuple[int, int, int] | None = None,
 ) -> dict[str, int | float]:
     """Estimate a conservative resident batch for fused complex FFT scoring."""
     if any(size < 1 for size in loaded_shape + core_shape + template_shape):
@@ -466,7 +512,9 @@ def plan_template_fft_batch(
 
     real_bytes = np.dtype(np.float32).itemsize
     complex_bytes = np.dtype(np.complex64).itemsize
+    planned_fft_shape = plan_cufft_fft_shape(loaded_shape, fft_shape)
     loaded_voxels = int(np.prod(loaded_shape))
+    fft_voxels = int(np.prod(planned_fft_shape))
     output_voxels = int(
         np.prod(tuple(size + 2 * _LOCAL_MAXIMUM_RADIUS for size in core_shape))
     )
@@ -476,13 +524,13 @@ def plan_template_fft_batch(
         templates_per_device * template_voxels * complex_bytes
     )
     fixed_bytes = (
-        loaded_voxels
-        * (real_bytes + _SCORE_FIXED_COMPLEX_ARRAYS * complex_bytes)
+        loaded_voxels * real_bytes
+        + fft_voxels * _SCORE_FIXED_COMPLEX_ARRAYS * complex_bytes
         + 2 * output_voxels * real_bytes
         + resident_template_bytes
     )
     bytes_per_batch_template = (
-        loaded_voxels * _SCORE_BATCH_COMPLEX_ARRAYS * complex_bytes
+        fft_voxels * _SCORE_BATCH_COMPLEX_ARRAYS * complex_bytes
     )
     available_bytes = budget_bytes - fixed_bytes
     batch_size = min(
@@ -503,6 +551,11 @@ def plan_template_fft_batch(
             fixed_bytes + batch_size * bytes_per_batch_template
         ),
         "memory_fraction": float(memory_fraction),
+        "loaded_voxels": loaded_voxels,
+        "fft_voxels": fft_voxels,
+        "fft_shape_z": planned_fft_shape[0],
+        "fft_shape_y": planned_fft_shape[1],
+        "fft_shape_x": planned_fft_shape[2],
     }
 
 
@@ -590,15 +643,17 @@ def compute_fused_klt_score_shard(
     score_halo: int,
     template_batch_size: int,
     axis_name: str | None,
+    fft_shape: tuple[int, int, int] | None = None,
 ) -> jax.Array:
     """Accumulate one template shard using a shared fused subvolume FFT."""
     if local_templates.shape[0] % template_batch_size:
         raise ValueError("local template shard must contain complete batches")
-    fft_shape = tuple(int(size) for size in loaded_subvolume.shape)
+    loaded_shape = tuple(int(size) for size in loaded_subvolume.shape)
+    fft_shape = plan_cufft_fft_shape(loaded_shape, fft_shape)
     output_shape = tuple(size + 2 * score_halo for size in core_shape)
     crop_start = whitening_radius + template_radius
 
-    volume_spectrum = jnp.fft.fftn(loaded_subvolume)
+    volume_spectrum = jnp.fft.fftn(loaded_subvolume, s=fft_shape)
     whitening_spectrum = _centered_filter_spectrum(
         whitening_filter,
         fft_shape,
@@ -792,6 +847,7 @@ def score_template_shards_and_extract_candidates(
     template_radius: int,
     candidate_capacity: int,
     template_batch_size: int,
+    fft_shape: tuple[int, int, int] | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """All-reduce template-sharded scores and extract candidates once."""
     haloed_scores = compute_fused_klt_score_shard(
@@ -807,6 +863,7 @@ def score_template_shards_and_extract_candidates(
         score_halo=_LOCAL_MAXIMUM_RADIUS,
         template_batch_size=template_batch_size,
         axis_name=_TEMPLATE_AXIS_NAME,
+        fft_shape=fft_shape,
     )
 
     def extract(_: None) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -912,6 +969,7 @@ class MultiGPUKLTParticleDetector3D:
         nms_radius: float | None = None,
         score_template_batch_size: int | None = None,
         score_memory_fraction: float = _DEFAULT_SCORE_MEMORY_FRACTION,
+        score_fft_shape: tuple[int, int, int] | None = None,
         boundary_mode: PaddingMode = "constant",
     ) -> None:
         """Initialize shared streaming geometry and the KLT template model."""
@@ -934,6 +992,10 @@ class MultiGPUKLTParticleDetector3D:
             raise ValueError("score_template_batch_size must be positive")
         if not 0 < score_memory_fraction <= 1:
             raise ValueError("score_memory_fraction must lie in (0, 1]")
+        if score_fft_shape is not None and (
+            len(score_fft_shape) != 3 or any(size < 1 for size in score_fft_shape)
+        ):
+            raise ValueError("score_fft_shape must contain three positive values")
 
         patch_size = (
             default_psd_patch_size(particle_diameter, mgscale)
@@ -1005,6 +1067,11 @@ class MultiGPUKLTParticleDetector3D:
         self.device_memory_bytes = memory_limit
         self.score_template_batch_size = score_template_batch_size
         self.score_memory_fraction = score_memory_fraction
+        self.score_fft_shape = (
+            None
+            if score_fft_shape is None
+            else tuple(int(size) for size in score_fft_shape)
+        )
         self.score_plan: dict[str, int | float] | None = None
         self.processor = MultiGPUSubvolumeProcessor(
             source,
@@ -1192,6 +1259,8 @@ class MultiGPUKLTParticleDetector3D:
         total_halo = (
             whitening_radius + template_radius + _LOCAL_MAXIMUM_RADIUS
         )
+        loaded_shape = self.processor.loaded_shape(total_halo)
+        fft_shape = plan_cufft_fft_shape(loaded_shape, self.score_fft_shape)
         device_count = len(self.devices)
         templates_per_device = (
             templates.shape[0] + device_count - 1
@@ -1206,12 +1275,13 @@ class MultiGPUKLTParticleDetector3D:
                 }
             else:
                 self.score_plan = plan_template_fft_batch(
-                    self.processor.loaded_shape(total_halo),
+                    loaded_shape,
                     self.processor.core_shape,
                     tuple(int(size) for size in templates.shape[1:]),
                     templates_per_device,
                     self.device_memory_bytes,
                     memory_fraction=self.score_memory_fraction,
+                    fft_shape=fft_shape,
                 )
                 batch_size = int(self.score_plan["batch_size"])
         batch_size = min(batch_size, templates_per_device)
@@ -1221,12 +1291,13 @@ class MultiGPUKLTParticleDetector3D:
 
         if self.device_memory_bytes is not None:
             capacity_plan = plan_template_fft_batch(
-                self.processor.loaded_shape(total_halo),
+                loaded_shape,
                 self.processor.core_shape,
                 tuple(int(size) for size in templates.shape[1:]),
                 padded_templates_per_device,
                 self.device_memory_bytes,
                 memory_fraction=self.score_memory_fraction,
+                fft_shape=fft_shape,
             )
             if int(capacity_plan["batch_size"]) < batch_size:
                 if self.score_template_batch_size is not None:
@@ -1241,12 +1312,13 @@ class MultiGPUKLTParticleDetector3D:
                     * batch_size
                 )
                 capacity_plan = plan_template_fft_batch(
-                    self.processor.loaded_shape(total_halo),
+                    loaded_shape,
                     self.processor.core_shape,
                     tuple(int(size) for size in templates.shape[1:]),
                     padded_templates_per_device,
                     self.device_memory_bytes,
                     memory_fraction=self.score_memory_fraction,
+                    fft_shape=fft_shape,
                 )
             capacity_plan["batch_size"] = batch_size
             capacity_plan["templates_per_device"] = padded_templates_per_device
@@ -1275,6 +1347,15 @@ class MultiGPUKLTParticleDetector3D:
             batch_size,
             padded_templates_per_device // batch_size,
             self.processor.subvolume_count,
+        )
+        LOGGER.info(
+            "KLT score FFT geometry: loaded=%s | FFT=%s | end padding=%s",
+            loaded_shape,
+            fft_shape,
+            tuple(
+                planned - required
+                for planned, required in zip(fft_shape, loaded_shape, strict=True)
+            ),
         )
         if self.score_plan is not None and "estimated_peak_bytes" in self.score_plan:
             LOGGER.info(
@@ -1331,6 +1412,7 @@ class MultiGPUKLTParticleDetector3D:
             template_radius=template_radius,
             candidate_capacity=candidate_capacity,
             template_batch_size=batch_size,
+            fft_shape=fft_shape,
         )
         distributed_score = jax.pmap(
             configured_score,

@@ -12,7 +12,9 @@ from kltpicker_3d.multi_gpu import (
     construct_klt_score_filters,
     distributed_block_qr_score_parameters,
     extract_score_candidates,
+    next_cufft_fast_length,
     orthogonal_klt_score_parameters,
+    plan_cufft_fft_shape,
     plan_template_fft_batch,
     ranked_candidate_nms_3d,
 )
@@ -100,6 +102,101 @@ def test_distributed_block_qr_preserves_each_signal_covariance():
     )
 
 
+def test_nonnegative_m_scoring_matches_explicit_conjugate_pairs():
+    rng = np.random.default_rng(2026)
+    positive = (
+        rng.standard_normal((2, 3, 3, 3))
+        + 1j * rng.standard_normal((2, 3, 3, 3))
+    ).astype(np.complex64)
+    zero = rng.standard_normal((2, 3, 3, 3)).astype(np.complex64)
+    templates = np.empty((6, 3, 3, 3), dtype=np.complex64)
+    for radial_index in range(2):
+        start = 3 * radial_index
+        templates[start] = -np.conj(positive[radial_index])
+        templates[start + 1] = zero[radial_index]
+        templates[start + 2] = positive[radial_index]
+
+    eigenvalues = np.repeat(
+        np.array([3.0, 0.75], dtype=np.float32),
+        3,
+    )
+    orders = np.ones(6, dtype=np.int64)
+    m_values = np.tile(np.array([-1, 0, 1], dtype=np.int64), 2)
+    kernels, effective_weights, offset, transformed_eigenvalues = (
+        distributed_block_qr_score_parameters(
+            templates,
+            eigenvalues,
+            orders,
+            m_values,
+            noise_variance=0.8,
+            devices=(jax.devices()[0],),
+            host_qr=True,
+        )
+    )
+
+    assert kernels.shape == (4, 3, 3, 3)
+    representative_m = m_values[m_values >= 0]
+    assert_array_equal(representative_m, np.array([0, 1, 0, 1]))
+    multiplicities = np.where(representative_m == 0, 1, 2)
+    expected_base_weights = 1 / 0.8 - 1 / (
+        0.8 + transformed_eigenvalues
+    )
+    assert_allclose(
+        effective_weights,
+        multiplicities * expected_base_weights,
+        rtol=2e-5,
+    )
+    assert_allclose(
+        offset,
+        np.sum(
+            multiplicities
+            * np.log1p(transformed_eigenvalues / 0.8)
+        ),
+        rtol=2e-5,
+    )
+
+    zero_indices = np.flatnonzero(representative_m == 0)
+    positive_indices = np.flatnonzero(representative_m > 0)
+    expanded_kernels = np.concatenate(
+        (
+            kernels[zero_indices],
+            kernels[positive_indices],
+            np.conj(kernels[positive_indices]),
+        )
+    )
+    expanded_weights = np.concatenate(
+        (
+            effective_weights[zero_indices],
+            effective_weights[positive_indices] / 2,
+            effective_weights[positive_indices] / 2,
+        )
+    )
+    loaded = rng.standard_normal((5, 5, 5)).astype(np.float32)
+    whitening_filter = np.ones((1, 1, 1), dtype=np.float32)
+    compressed_score = compute_klt_score_block(
+        jnp.asarray(loaded),
+        jnp.asarray(whitening_filter),
+        jnp.asarray(kernels),
+        jnp.asarray(effective_weights),
+        jnp.asarray(offset),
+        core_shape=(3, 3, 3),
+        whitening_radius=0,
+        score_halo=0,
+    )
+    expanded_score = compute_klt_score_block(
+        jnp.asarray(loaded),
+        jnp.asarray(whitening_filter),
+        jnp.asarray(expanded_kernels),
+        jnp.asarray(expanded_weights),
+        jnp.asarray(offset),
+        core_shape=(3, 3, 3),
+        whitening_radius=0,
+        score_halo=0,
+    )
+
+    assert_allclose(compressed_score, expanded_score, rtol=2e-5, atol=2e-5)
+
+
 def test_fused_batched_fft_matches_sequential_convolution():
     rng = np.random.default_rng(44)
     core_shape = (5, 5, 5)
@@ -142,6 +239,61 @@ def test_fused_batched_fft_matches_sequential_convolution():
     )
 
     assert_allclose(fused, sequential, rtol=1e-5, atol=2e-4)
+
+
+def test_cufft_fast_length_and_shape_planning():
+    assert next_cufft_fast_length(358) == 360
+    assert next_cufft_fast_length(360) == 360
+    assert plan_cufft_fft_shape((358, 359, 360)) == (360, 360, 360)
+    assert plan_cufft_fft_shape((358, 359, 360), (360, 364, 375)) == (
+        360,
+        364,
+        375,
+    )
+
+
+def test_fast_fft_padding_preserves_fused_valid_scores():
+    rng = np.random.default_rng(45)
+    loaded = rng.standard_normal((11, 11, 11)).astype(np.float32)
+    whitening_filter = rng.standard_normal((3, 3, 3)).astype(np.float32)
+    templates = (
+        rng.standard_normal((2, 3, 3, 3))
+        + 1j * rng.standard_normal((2, 3, 3, 3))
+    ).astype(np.complex64)
+    normalization, weights, offset, _ = orthogonal_klt_score_parameters(
+        templates,
+        np.array([2.0, 0.75]),
+        0.8,
+    )
+
+    arguments = (
+        jnp.asarray(loaded),
+        jnp.asarray(whitening_filter),
+        jnp.asarray(templates),
+        jnp.asarray(normalization),
+        jnp.asarray(weights),
+        jnp.asarray(offset),
+    )
+    options = dict(
+        core_shape=(5, 5, 5),
+        whitening_radius=1,
+        template_radius=1,
+        score_halo=1,
+        template_batch_size=2,
+        axis_name=None,
+    )
+    exact = compute_fused_klt_score_shard(
+        *arguments,
+        **options,
+        fft_shape=(11, 11, 11),
+    )
+    padded = compute_fused_klt_score_shard(
+        *arguments,
+        **options,
+        fft_shape=(12, 12, 12),
+    )
+
+    assert_allclose(padded, exact, rtol=2e-5, atol=2e-4)
 
 
 def test_fft_batch_planner_accounts_for_resident_template_shard():
@@ -302,3 +454,9 @@ def test_complete_multi_gpu_detector_executes_on_streamed_volume():
     assert detector.initial_rpsds.rpsds.shape[0] == 4**3
     assert detector.whitened_rpsds.rpsds.shape == detector.initial_rpsds.rpsds.shape
     assert detector.templates.ndim == 4
+    assert np.all(detector.model.template_m_values >= 0)
+    assert detector.templates.shape[0] == detector.score_templates.shape[0]
+    assert_allclose(
+        np.sum(detector.model.template_multiplicities),
+        detector.model.retained_template_count,
+    )

@@ -52,7 +52,7 @@ DEFAULT_RESULTS_DIR = REPOSITORY_ROOT / "results/empiar-10045-bandpass-block-qr"
 
 LOGGER = logging.getLogger("empiar-10045")
 T = TypeVar("T")
-_SCORE_MODEL_METHOD = "block_qr_ell_m_v2_fourier_normalized"
+_SCORE_MODEL_METHOD = "block_qr_nonnegative_m_v3_fourier_normalized"
 
 
 def parse_args() -> argparse.Namespace:
@@ -135,6 +135,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nms-radius", type=float)
     parser.add_argument("--score-template-batch-size", type=int)
     parser.add_argument("--score-memory-fraction", type=float, default=0.8)
+    parser.add_argument(
+        "--score-fft-shape",
+        type=int,
+        nargs=3,
+        metavar=("Z", "Y", "X"),
+        help="Override automatic cuFFT-friendly scoring dimensions.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -342,11 +349,16 @@ def prepare_block_qr_checkpoint(
     temporary_stream.close()
     try:
         template_array = np.asanyarray(templates)
+        if detector.model.template_m_values is None:
+            raise RuntimeError("template m values have not been initialized")
+        representative_count = int(
+            np.count_nonzero(detector.model.template_m_values >= 0)
+        )
         output = np.lib.format.open_memmap(
             temporary,
             mode="w+",
             dtype=np.complex64,
-            shape=template_array.shape,
+            shape=(representative_count, *template_array.shape[1:]),
         )
         detector.prepare_score_filters(
             template_array,
@@ -711,6 +723,11 @@ def main() -> None:
                 nms_radius=args.nms_radius,
                 score_template_batch_size=args.score_template_batch_size,
                 score_memory_fraction=args.score_memory_fraction,
+                score_fft_shape=(
+                    None
+                    if args.score_fft_shape is None
+                    else tuple(args.score_fft_shape)
+                ),
             )
             log_plan(args, detector, voxel_size, header_spacing, truth_count)
             LOGGER.info(
@@ -732,7 +749,7 @@ def main() -> None:
                 "whitening_support_radius": args.whitening_support_radius,
                 "bandpass_low_fraction": args.bandpass_low_fraction,
                 "bandpass_high_fraction": args.bandpass_high_fraction,
-                "score_basis": "distributed_block_qr_by_ell_m_v1",
+                "score_basis": "distributed_block_qr_nonnegative_m_v3",
                 "template_side": detector.model.template_side,
                 "fredholm_radius_voxels": detector.model.fredholm_radius_voxels,
                 "max_order": detector.model.max_order,
@@ -740,6 +757,7 @@ def main() -> None:
                 "max_templates": args.max_templates,
                 "score_template_batch_size": args.score_template_batch_size,
                 "score_memory_fraction": args.score_memory_fraction,
+                "score_fft_shape": detector.score_fft_shape,
                 "nms_radius_voxels": detector.model.nms_radius_voxels,
                 "match_radius_angstrom": match_radius_angstrom,
                 "match_radius_voxels": match_radius_voxels,
@@ -948,6 +966,9 @@ def main() -> None:
                     radial_eigenfunctions=detector.model.eigfuncs,
                     template_orders=detector.model.template_orders,
                     template_m_values=detector.model.template_m_values,
+                    template_multiplicities=(
+                        detector.model.template_multiplicities
+                    ),
                     available_radial_mode_count=np.asarray(
                         detector.model.available_radial_mode_count
                     ),
@@ -993,6 +1014,22 @@ def main() -> None:
                 detector.model.template_m_values = metadata[
                     "template_m_values"
                 ].copy()
+                detector.model.template_multiplicities = (
+                    metadata["template_multiplicities"].copy()
+                    if "template_multiplicities" in metadata
+                    else (
+                        np.ones_like(
+                            detector.model.template_m_values,
+                            dtype=np.float32,
+                        )
+                        if np.any(detector.model.template_m_values < 0)
+                        else np.where(
+                            detector.model.template_m_values == 0,
+                            1,
+                            2,
+                        ).astype(np.float32)
+                    )
+                )
                 for name in (
                     "available_radial_mode_count",
                     "available_template_count",
@@ -1057,9 +1094,11 @@ def main() -> None:
             log_array("KLT templates", detector.templates)
             log_array("Template eigenvalues", detector.model.eigvals)
             LOGGER.info(
-                "Templates: complete modes=%d | radial modes=%s | "
-                "available complete=%s | retained energy=%s | spatial shape=%s",
+                "Templates: stored m>=0 representatives=%d | effective complete "
+                "modes=%s | radial modes=%s | available complete=%s | "
+                "retained energy=%s | spatial shape=%s",
                 detector.templates.shape[0],
+                detector.model.retained_template_count,
                 detector.model.retained_radial_mode_count,
                 detector.model.available_template_count,
                 (
@@ -1078,6 +1117,8 @@ def main() -> None:
                     score_checkpoint_compatible = (
                         "method" in score_model
                         and score_model["method"].item() == _SCORE_MODEL_METHOD
+                        and "score_multiplicities" in score_model
+                        and "score_template_indices" in score_model
                     )
             score_model_recomputed = False
             if (
@@ -1115,6 +1156,12 @@ def main() -> None:
                     detector.score_offset = np.float32(score_model["score_offset"])
                     detector.adjusted_template_eigenvalues = score_model[
                         "adjusted_template_eigenvalues"
+                    ].copy()
+                    detector.score_multiplicities = score_model[
+                        "score_multiplicities"
+                    ].copy()
+                    detector.score_template_indices = score_model[
+                        "score_template_indices"
                     ].copy()
             else:
                 if (
@@ -1155,12 +1202,20 @@ def main() -> None:
                     adjusted_template_eigenvalues=(
                         detector.adjusted_template_eigenvalues
                     ),
+                    score_multiplicities=detector.score_multiplicities,
+                    score_template_indices=detector.score_template_indices,
                     noise_variance=np.asarray(
                         detector.whitened_model.noise_variance
                     ),
                 )
             log_array("KLT score weights", detector.score_weights)
             LOGGER.info("Block-QR score templates: %s", score_templates_path)
+            LOGGER.info(
+                "Conjugate symmetry: executed representatives=%d | "
+                "effective modes=%d",
+                detector.score_templates.shape[0],
+                int(np.sum(detector.score_multiplicities)),
+            )
             LOGGER.info("KLT likelihood offset: %.8g", detector.score_offset)
 
             candidate_tag = f"top{args.candidate_capacity_per_subvolume}"
