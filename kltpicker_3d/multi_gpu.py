@@ -246,13 +246,15 @@ def distributed_block_qr_score_parameters(
     np.float32,
     npt.NDArray[np.float64],
 ]:
-    """Compute independent QR likelihood bases for every ``(ell, m)`` block.
+    """Compute independent QR likelihood bases for ``m >= 0`` blocks.
 
     Same-width blocks are dispatched independently across the selected devices.
     ``host_qr`` uses NumPy/LAPACK for systems whose GPU backend does not support
     complex QR. No Gram-matrix precheck is performed: block QR is the scoring
     definition. Cross-block orthogonality follows the spherical-harmonic
-    construction.
+    construction. Positive-``m`` weights and likelihood-offset terms receive
+    multiplicity two because their omitted negative-``m`` partners have
+    conjugate responses for a real tomogram.
     """
     template_array = np.asanyarray(templates)
     eigenvalues = np.asarray(template_eigenvalues, dtype=np.float32)
@@ -263,26 +265,70 @@ def distributed_block_qr_score_parameters(
     mode_count = template_array.shape[0]
     if any(values.shape != (mode_count,) for values in (eigenvalues, orders, m_values)):
         raise ValueError("eigenvalues, orders, and m values must match templates")
+    if np.any(orders < 0) or np.any(np.abs(m_values) > orders):
+        raise ValueError("template m values must satisfy abs(m) <= ell")
     if noise_variance <= 0 or not np.isfinite(noise_variance):
         raise ValueError("noise_variance must be positive and finite")
     selected_devices = tuple(jax.devices() if devices is None else devices)
     if not selected_devices:
         raise ValueError("at least one JAX device is required")
 
-    if output is None:
-        score_templates = np.empty(template_array.shape, dtype=np.complex64)
-    else:
-        if output.shape != template_array.shape or output.dtype != np.complex64:
-            raise ValueError("output must be complex64 with the template shape")
-        score_templates = output
-    score_weights = np.empty(mode_count, dtype=np.float32)
-    signal_eigenvalues = np.empty(mode_count, dtype=np.float64)
-    voxel_count = int(np.prod(template_array.shape[1:]))
+    # Full template banks may be passed when resuming an older stage-6
+    # checkpoint. Verify their paired metadata before dropping the redundant
+    # negative-m blocks. Newly constructed multi-GPU banks already contain
+    # only m >= 0 representatives.
+    if np.any(m_values < 0):
+        for order, m_value in sorted(
+            set(
+                zip(
+                    orders[m_values < 0].tolist(),
+                    (-m_values[m_values < 0]).tolist(),
+                )
+            )
+        ):
+            negative = np.flatnonzero((orders == order) & (m_values == -m_value))
+            positive = np.flatnonzero((orders == order) & (m_values == m_value))
+            if negative.size != positive.size or not np.allclose(
+                eigenvalues[negative],
+                eigenvalues[positive],
+            ):
+                raise ValueError(
+                    "positive- and negative-m blocks must have matching "
+                    "eigenvalues for conjugate compression"
+                )
 
-    blocks_by_width: dict[int, list[npt.NDArray[np.int64]]] = {}
+    representative_indices = np.flatnonzero(m_values >= 0)
+    representative_count = representative_indices.size
+    if representative_count < 1:
+        raise ValueError("at least one nonnegative-m template is required")
+    output_shape = (representative_count, *template_array.shape[1:])
+    if output is None:
+        score_templates = np.empty(output_shape, dtype=np.complex64)
+    else:
+        if output.shape != output_shape or output.dtype != np.complex64:
+            raise ValueError(
+                "output must be complex64 with the nonnegative-m template shape"
+            )
+        score_templates = output
+    score_weights = np.empty(representative_count, dtype=np.float32)
+    signal_eigenvalues = np.empty(representative_count, dtype=np.float64)
+    voxel_count = int(np.prod(template_array.shape[1:]))
+    output_positions = np.full(mode_count, -1, dtype=np.int64)
+    output_positions[representative_indices] = np.arange(representative_count)
+
+    blocks_by_width: dict[
+        int,
+        list[tuple[npt.NDArray[np.int64], npt.NDArray[np.int64], float]],
+    ] = {}
     for order, m_value in sorted(set(zip(orders.tolist(), m_values.tolist()))):
+        if m_value < 0:
+            continue
         indices = np.flatnonzero((orders == order) & (m_values == m_value))
-        blocks_by_width.setdefault(indices.size, []).append(indices)
+        output_indices = output_positions[indices]
+        multiplicity = 1.0 if m_value == 0 else 2.0
+        blocks_by_width.setdefault(indices.size, []).append(
+            (indices, output_indices, multiplicity)
+        )
 
     total_offset = 0.0
     for width, blocks in sorted(blocks_by_width.items()):
@@ -293,7 +339,11 @@ def distributed_block_qr_score_parameters(
             len(selected_devices),
         )
         if host_qr:
-            for block_index, indices in enumerate(blocks, start=1):
+            for block_index, (
+                indices,
+                output_indices,
+                multiplicity,
+            ) in enumerate(blocks, start=1):
                 LOGGER.info(
                     "Host block QR %d/%d for radial width=%d",
                     block_index,
@@ -311,13 +361,13 @@ def distributed_block_qr_score_parameters(
                         float(noise_variance),
                     )
                 )
-                score_templates[indices] = basis_block.reshape(
+                score_templates[output_indices] = basis_block.reshape(
                     width,
                     *template_array.shape[1:],
                 )
-                score_weights[indices] = weight_block
-                signal_eigenvalues[indices] = eigenvalue_block
-                total_offset += float(offset)
+                score_weights[output_indices] = multiplicity * weight_block
+                signal_eigenvalues[output_indices] = eigenvalue_block
+                total_offset += multiplicity * float(offset)
             continue
         compiled_qr = jax.jit(
             partial(_qr_score_block, noise_variance=float(noise_variance)),
@@ -332,7 +382,9 @@ def distributed_block_qr_score_parameters(
                 len(round_blocks),
             )
             pending_results = []
-            for slot, indices in enumerate(round_blocks):
+            for slot, (indices, output_indices, multiplicity) in enumerate(
+                round_blocks
+            ):
                 host_templates = np.asarray(
                     template_array[indices],
                     dtype=np.complex64,
@@ -342,7 +394,8 @@ def distributed_block_qr_score_parameters(
                 device_eigenvalues = jax.device_put(eigenvalues[indices], device)
                 pending_results.append(
                     (
-                        indices,
+                        output_indices,
+                        multiplicity,
                         compiled_qr(device_templates, device_eigenvalues),
                     )
                 )
@@ -350,17 +403,17 @@ def distributed_block_qr_score_parameters(
             # JAX dispatch is asynchronous. Launch every independent block
             # before gathering any result so the selected GPUs work in
             # parallel without a replicated pmap computation or collectives.
-            for indices, device_result in pending_results:
+            for output_indices, multiplicity, device_result in pending_results:
                 basis_block, weight_block, offset, eigenvalue_block = (
                     np.asarray(value) for value in device_result
                 )
-                score_templates[indices] = basis_block.reshape(
+                score_templates[output_indices] = basis_block.reshape(
                     width,
                     *template_array.shape[1:],
                 )
-                score_weights[indices] = weight_block
-                signal_eigenvalues[indices] = eigenvalue_block
-                total_offset += float(offset)
+                score_weights[output_indices] = multiplicity * weight_block
+                signal_eigenvalues[output_indices] = eigenvalue_block
+                total_offset += multiplicity * float(offset)
     return (
         score_templates,
         score_weights,
@@ -971,6 +1024,8 @@ class MultiGPUKLTParticleDetector3D:
         self.score_templates: npt.NDArray[np.complex64] | None = None
         self.template_normalization: npt.NDArray[np.float32] | None = None
         self.score_weights: npt.NDArray[np.float32] | None = None
+        self.score_multiplicities: npt.NDArray[np.float32] | None = None
+        self.score_template_indices: npt.NDArray[np.int64] | None = None
         self.score_offset: np.float32 | None = None
         self.adjusted_template_eigenvalues: npt.NDArray[np.float64] | None = None
         self.candidates: npt.NDArray[np.float64] | None = None
@@ -1041,6 +1096,7 @@ class MultiGPUKLTParticleDetector3D:
             eigenfunctions,
             orders,
             particle_nodes,
+            nonnegative_m_only=True,
         )
         return templates
 
@@ -1082,6 +1138,13 @@ class MultiGPUKLTParticleDetector3D:
             self.score_weights.shape,
             dtype=np.float32,
         )
+        m_values = np.asarray(self.model.template_m_values, dtype=np.int64)
+        self.score_template_indices = np.flatnonzero(m_values >= 0)
+        self.score_multiplicities = np.where(
+            m_values[self.score_template_indices] == 0,
+            1,
+            2,
+        ).astype(np.float32)
         return parameters
 
     def score_candidates(
@@ -1104,9 +1167,18 @@ class MultiGPUKLTParticleDetector3D:
             or self.score_offset is None
             or self.adjusted_template_eigenvalues is None
             or self.score_templates is None
-            or self.template_normalization.shape != (raw_templates.shape[0],)
         ):
             self.prepare_score_filters(raw_templates, noise_variance)
+        score_count = self.score_templates.shape[0]
+        if any(
+            values.shape != (score_count,)
+            for values in (
+                self.template_normalization,
+                self.score_weights,
+                self.adjusted_template_eigenvalues,
+            )
+        ):
+            raise RuntimeError("score-model arrays do not match score templates")
         templates = np.asanyarray(self.score_templates)
         normalization = self.template_normalization
         score_weights = self.score_weights

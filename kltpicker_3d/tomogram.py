@@ -269,6 +269,7 @@ class KLTParticleDetector3D:
         self.radial_eigvals: npt.NDArray[np.float64] | None = None
         self.template_orders: npt.NDArray[np.int64] | None = None
         self.template_m_values: npt.NDArray[np.int64] | None = None
+        self.template_multiplicities: npt.NDArray[np.float32] | None = None
         self.templates: npt.NDArray[np.generic] | None = None
 
     def process_tomogram(
@@ -474,6 +475,8 @@ class KLTParticleDetector3D:
         eigenfunctions: npt.ArrayLike,
         angular_orders: npt.ArrayLike,
         particle_psd_nodes: npt.ArrayLike,
+        *,
+        nonnegative_m_only: bool = False,
     ) -> tuple[
         npt.NDArray[np.generic],
         npt.NDArray[np.generic],
@@ -488,8 +491,10 @@ class KLTParticleDetector3D:
             particle_psd_nodes: Particle PSD at frequency quadrature nodes.
 
         Returns:
-            Complete spherical-harmonic templates and one eigenvalue per
-            returned angular mode.
+            Spherical-harmonic templates and one eigenvalue per returned
+            angular mode. When ``nonnegative_m_only`` is true, one complex
+            representative is returned for every conjugate ``+m/-m`` pair;
+            ``template_multiplicities`` records multiplicity two for ``m>0``.
         """
         eigenvalues = np.asarray(eigenvalues)
         eigenfunctions = np.asarray(eigenfunctions)
@@ -622,7 +627,13 @@ class KLTParticleDetector3D:
             / eigenvalues[:, None]
         )
 
-        template_count = int(np.sum(2 * angular_orders + 1))
+        template_count = int(
+            np.sum(
+                angular_orders + 1
+                if nonnegative_m_only
+                else 2 * angular_orders + 1
+            )
+        )
         templates = np.empty(
             (template_count, *radius_tensor.shape),
             dtype=np.complex64,
@@ -630,6 +641,7 @@ class KLTParticleDetector3D:
         template_eigenvalues = np.empty(template_count, dtype=np.float64)
         template_orders = np.empty(template_count, dtype=np.int64)
         template_m_values = np.empty(template_count, dtype=np.int64)
+        template_multiplicities = np.empty(template_count, dtype=np.float32)
 
         angular_cache: dict[int, npt.NDArray[np.complex64]] = {}
         output_start = 0
@@ -650,6 +662,11 @@ class KLTParticleDetector3D:
                     dtype=np.complex64,
                 )
             angular_modes = angular_cache[order]
+            m_values = np.arange(-order, order + 1, dtype=np.int64)
+            if nonnegative_m_only:
+                keep = m_values >= 0
+                angular_modes = angular_modes[keep]
+                m_values = m_values[keep]
             multiplicity = angular_modes.shape[0]
             output_stop = output_start + multiplicity
             radial_template = np.zeros(radius_tensor.shape, dtype=np.complex64)
@@ -667,16 +684,18 @@ class KLTParticleDetector3D:
                 radial_index
             ]
             template_orders[output_start:output_stop] = order
-            template_m_values[output_start:output_stop] = np.arange(
-                -order,
-                order + 1,
-                dtype=np.int64,
+            template_m_values[output_start:output_stop] = m_values
+            template_multiplicities[output_start:output_stop] = (
+                np.where(m_values == 0, 1, 2)
+                if nonnegative_m_only
+                else np.ones(multiplicity)
             )
             output_start = output_stop
 
         self.eigvals = template_eigenvalues
         self.template_orders = template_orders
         self.template_m_values = template_m_values
+        self.template_multiplicities = template_multiplicities
         return templates, template_eigenvalues
 
     def create_GPSF_templates(  # noqa: N802

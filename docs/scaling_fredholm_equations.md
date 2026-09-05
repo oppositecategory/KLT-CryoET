@@ -162,13 +162,21 @@ The tomogram is memory-mapped on the host and partitioned into fixed core region
 
 ### Fredholm solution and template construction
 
-The radial Fredholm equations are solved independently for each $\ell$. After numerical and energy truncation, every retained $(\ell,n)$ mode is expanded over $m$ and interpolated into a Cartesian template.
+The radial Fredholm equations are solved independently for each $\ell$. Energy selection and the template cap continue to count the complete $2\ell+1$ multiplicity. The multi-GPU execution representation materializes only $m\geq0$: $m=0$ has multiplicity one, while each $m>0$ complex template represents its conjugate $\pm m$ pair with multiplicity two.
+
+For a real whitened tomogram, the paired responses obey
+
+$$
+|r_{\ell n,-m}(x)|^2=|r_{\ell n,m}(x)|^2.
+$$
+
+Consequently, positive-$m$ quadratic and likelihood-offset contributions are multiplied by two. This preserves the complete covariance model while avoiding the negative-$m$ template, spectrum, and inverse FFT.
 
 The high-order Fredholm solve is relatively cheap compared with full-volume scoring. It should be performed once at a deliberately high ceiling and cached. Different template budgets can then reuse the eigenpairs and repeat only template selection, template construction, QR, and scoring.
 
 ### Distributed $(\ell,m)$ block QR
 
-For a fixed $(\ell,m)$, the retained radial templates are arranged as columns:
+For a fixed retained $(\ell,m)$ block with $m\geq0$, the radial templates are arranged as columns:
 
 $$
 A_{\ell m}
@@ -206,8 +214,10 @@ For GPU $g$, the partial score is
 
 $$
 S_g(x)=\sum_{j\in\mathcal T_g}
-w_j\left|r_j(x)\right|^2.
+\mu_j w_j\left|r_j(x)\right|^2,
 $$
+
+where $\mu_j=1$ for $m=0$ and $\mu_j=2$ for $m>0$.
 
 The collective constructs
 
