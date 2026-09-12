@@ -32,6 +32,7 @@ from kltpicker_3d.utils import (
     calibrate_radial_psds,
     construct_finite_bandpass_filter,
     construct_finite_whitening_filter,
+    radial_psd_to_variance,
 )
 
 _ALS_CONVERGENCE_TOLERANCE = 1e-4
@@ -100,6 +101,172 @@ class CalibratedRpsdModel:
     particle_psd: npt.NDArray[np.float64]
     noise_psd: npt.NDArray[np.float64]
     noise_variance: float
+
+
+def estimate_low_variance_noise_rpsd(
+    extraction: RpsdExtractionResult,
+    *,
+    fraction: float = _NOISE_PATCH_FRACTION,
+) -> tuple[npt.NDArray[np.float64], float]:
+    """Estimate the residual radial noise PSD from quiet processed patches.
+
+    The same lowest-variance patch population used by the scalar likelihood
+    calibration is averaged frequency by frequency.  The radial curve is then
+    rescaled so its 3-D integral equals that population's measured spatial
+    variance.  This supplies the *shape* discarded by the scalar model while
+    preserving its robust overall calibration.
+    """
+    if not 0 < fraction <= 1:
+        raise ValueError("noise patch fraction must lie in (0, 1]")
+    rpsds = np.asarray(extraction.rpsds, dtype=np.float64)
+    variances = np.asarray(extraction.variances, dtype=np.float64)
+    if rpsds.ndim != 2 or variances.shape != (rpsds.shape[0],):
+        raise ValueError("invalid streamed RPSD result")
+    count = max(1, int(np.floor(fraction * variances.size)))
+    indices = np.argpartition(variances, count - 1)[:count]
+    target_variance = float(np.mean(variances[indices]))
+    radial_psd = np.maximum(np.mean(rpsds[indices], axis=0), 0.0)
+    integrated = radial_psd_to_variance(extraction.radial_points, radial_psd)
+    if not np.isfinite(integrated) or integrated <= 0:
+        raise ValueError("empirical residual noise RPSD is degenerate")
+    radial_psd *= target_variance / integrated
+    return radial_psd, target_variance
+
+
+def radial_noise_inverse_sqrt_multiplier(
+    radial_points: npt.ArrayLike,
+    noise_psd: npt.ArrayLike,
+    spatial_shape: tuple[int, int, int],
+    *,
+    floor_fraction: float = 0.1,
+) -> npt.NDArray[np.float64]:
+    """Return the circulant ``C_n**(-1/2)`` multiplier for one score box.
+
+    Frequencies suppressed by preprocessing make the empirical covariance
+    nearly singular.  A relative PSD floor defines a stable covariance model
+    there and prevents the experimental scorer from amplifying stop-band
+    numerical noise.
+    """
+    points = np.asarray(radial_points, dtype=np.float64)
+    psd = np.asarray(noise_psd, dtype=np.float64)
+    if points.ndim != 1 or psd.shape != points.shape or points.size < 2:
+        raise ValueError("radial noise samples must be equal-length 1-D arrays")
+    if np.any(np.diff(points) <= 0) or points[0] < 0 or points[-1] > np.pi:
+        raise ValueError("radial points must increase from zero to at most pi")
+    if not np.all(np.isfinite(psd)) or np.any(psd < 0):
+        raise ValueError("noise PSD must be finite and nonnegative")
+    if len(spatial_shape) != 3 or any(size < 1 for size in spatial_shape):
+        raise ValueError("spatial_shape must contain three positive values")
+    if floor_fraction <= 0 or not np.isfinite(floor_fraction):
+        raise ValueError("floor_fraction must be positive and finite")
+    positive = psd[psd > 0]
+    if positive.size == 0:
+        raise ValueError("noise PSD must contain a positive value")
+    floor = floor_fraction * float(np.median(positive))
+    axes = [2 * np.pi * np.fft.fftfreq(size) for size in spatial_shape]
+    fz, fy, fx = np.meshgrid(*axes, indexing="ij")
+    radius = np.minimum(np.sqrt(fz * fz + fy * fy + fx * fx), points[-1])
+    covariance_spectrum = np.maximum(np.interp(radius, points, psd), floor)
+    return np.reciprocal(np.sqrt(covariance_spectrum))
+
+
+def _apply_fourier_multiplier(
+    arrays: npt.ArrayLike,
+    multiplier: npt.ArrayLike,
+) -> npt.NDArray[np.complex128]:
+    """Apply a real circulant Fourier multiplier over the last three axes."""
+    values = np.asarray(arrays)
+    multiplier = np.asarray(multiplier, dtype=np.float64)
+    if values.shape[-3:] != multiplier.shape:
+        raise ValueError("array and Fourier multiplier spatial shapes differ")
+    transformed = np.fft.fftn(values, axes=(-3, -2, -1), norm="ortho")
+    return np.fft.ifftn(
+        transformed * multiplier,
+        axes=(-3, -2, -1),
+        norm="ortho",
+    )
+
+
+def radial_colored_block_qr_score_parameters(
+    templates: npt.ArrayLike,
+    signal_eigenvalues: npt.ArrayLike,
+    template_orders: npt.ArrayLike,
+    template_m_values: npt.ArrayLike,
+    radial_points: npt.ArrayLike,
+    noise_psd: npt.ArrayLike,
+    *,
+    floor_fraction: float = 0.1,
+    output: npt.NDArray[np.complex64] | None = None,
+) -> tuple[
+    npt.NDArray[np.complex64],
+    npt.NDArray[np.float32],
+    np.float32,
+    npt.NDArray[np.float64],
+]:
+    """Build exact radial-colored Gaussian LLR filters block by block.
+
+    ``templates`` and ``signal_eigenvalues`` represent ``C_s``.  For every
+    angular block this routine forms ``A=C_n^-1/2 T``, diagonalizes
+    ``A Lambda A*``, and stores ``C_n^-1/2 b_j`` as the actual correlation
+    filters.  Consequently scoring the unmodified, first-pass-whitened data
+    computes ``<b_j, C_n^-1/2 x>`` without another volume filtering pass.
+    """
+    template_array = np.asanyarray(templates)
+    eigenvalues = np.asarray(signal_eigenvalues, dtype=np.float64)
+    orders = np.asarray(template_orders, dtype=np.int64)
+    m_values = np.asarray(template_m_values, dtype=np.int64)
+    if template_array.ndim != 4 or template_array.shape[0] < 1:
+        raise ValueError("templates must have shape (modes, z, y, x)")
+    count = template_array.shape[0]
+    if any(array.shape != (count,) for array in (eigenvalues, orders, m_values)):
+        raise ValueError("colored score metadata must match templates")
+    if np.any(m_values < 0):
+        raise ValueError("colored scorer expects nonnegative-m representatives")
+    if np.any(eigenvalues < 0) or not np.all(np.isfinite(eigenvalues)):
+        raise ValueError("signal eigenvalues must be finite and nonnegative")
+    multiplier = radial_noise_inverse_sqrt_multiplier(
+        radial_points,
+        noise_psd,
+        tuple(int(size) for size in template_array.shape[1:]),
+        floor_fraction=floor_fraction,
+    )
+    if output is None:
+        filters = np.empty(template_array.shape, dtype=np.complex64)
+    else:
+        if output.shape != template_array.shape or output.dtype != np.complex64:
+            raise ValueError("output must be complex64 and match templates")
+        filters = output
+    weights = np.empty(count, dtype=np.float32)
+    transformed_eigenvalues = np.empty(count, dtype=np.float64)
+    total_offset = 0.0
+    blocks = sorted(set(zip(orders.tolist(), m_values.tolist())))
+    for order, m_value in tqdm(blocks, desc="Colored-noise block QR", unit="block"):
+        indices = np.flatnonzero((orders == order) & (m_values == m_value))
+        whitened_templates = _apply_fourier_multiplier(
+            np.asarray(template_array[indices], dtype=np.complex64),
+            multiplier,
+        )
+        basis, block_weights, block_offset, block_eigenvalues = (
+            _host_qr_score_block(
+                whitened_templates.reshape(indices.size, -1).T,
+                np.asarray(eigenvalues[indices], dtype=np.float32),
+                1.0,
+            )
+        )
+        # The likelihood response is b* C_n^-1/2 x.  Store C_n^-1/2 b so the
+        # existing convolution kernel can apply it directly to x.
+        filters[indices] = np.asarray(
+            _apply_fourier_multiplier(
+                basis.reshape(indices.size, *template_array.shape[1:]),
+                multiplier,
+            ),
+            dtype=np.complex64,
+        )
+        multiplicity = 1.0 if m_value == 0 else 2.0
+        weights[indices] = multiplicity * block_weights
+        transformed_eigenvalues[indices] = block_eigenvalues
+        total_offset += multiplicity * float(block_offset)
+    return filters, weights, np.float32(total_offset), transformed_eigenvalues
 
 
 def fit_streamed_rpsds(

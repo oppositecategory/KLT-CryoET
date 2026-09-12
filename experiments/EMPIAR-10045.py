@@ -28,6 +28,8 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from kltpicker_3d.fredholm_solver import INVERSE_FOURIER_NORMALIZATION_3D
 from kltpicker_3d.multi_gpu import (
     MultiGPUKLTParticleDetector3D,
+    estimate_low_variance_noise_rpsd,
+    radial_colored_block_qr_score_parameters,
     ranked_candidate_nms_3d,
 )
 from kltpicker_3d.streaming import MrcVolumeSource
@@ -57,6 +59,7 @@ LOGGER = logging.getLogger("empiar-10045")
 T = TypeVar("T")
 _TEMPLATE_MODEL_METHOD = "linear_mass_preserving_psd_v2"
 _SCORE_MODEL_METHOD = "block_qr_nonnegative_m_v4_mass_preserving_psd"
+_COLORED_SCORE_MODEL_METHOD = "radial_colored_circulant_block_qr_v1"
 
 
 def parse_args() -> argparse.Namespace:
@@ -153,6 +156,22 @@ def parse_args() -> argparse.Namespace:
         help="Compact templates resident per GPU while streaming score shards.",
     )
     parser.add_argument("--score-memory-fraction", type=float, default=0.8)
+    parser.add_argument(
+        "--score-noise-model",
+        choices=("scalar", "radial-colored"),
+        default="scalar",
+        help=(
+            "Likelihood noise covariance. The experimental radial-colored "
+            "model estimates the residual spectrum from the quietest 25%% "
+            "of already-whitened patches."
+        ),
+    )
+    parser.add_argument(
+        "--colored-noise-floor-fraction",
+        type=float,
+        default=0.1,
+        help="PSD floor relative to the positive median for radial-colored scoring.",
+    )
     parser.add_argument(
         "--score-fft-shape",
         type=int,
@@ -397,6 +416,77 @@ def prepare_block_qr_checkpoint(
             temporary.unlink()
 
 
+def prepare_radial_colored_score_checkpoint(
+    detector: MultiGPUKLTParticleDetector3D,
+    base_templates: npt.ArrayLike,
+    radial_points: npt.ArrayLike,
+    noise_psd: npt.ArrayLike,
+    floor_fraction: float,
+    path: Path,
+) -> None:
+    """Build experimental colored-noise filters into an atomic NPY file."""
+    if detector.adjusted_template_eigenvalues is None:
+        raise RuntimeError("base block-QR signal eigenvalues are unavailable")
+    if detector.score_template_indices is None:
+        raise RuntimeError("base score-template indices are unavailable")
+    if (
+        detector.model.template_orders is None
+        or detector.model.template_m_values is None
+    ):
+        raise RuntimeError("template angular metadata is unavailable")
+    indices = detector.score_template_indices
+    orders = np.asarray(detector.model.template_orders)[indices]
+    m_values = np.asarray(detector.model.template_m_values)[indices]
+    base_templates = np.asanyarray(base_templates)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_stream = tempfile.NamedTemporaryFile(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    temporary = Path(temporary_stream.name)
+    temporary_stream.close()
+    try:
+        output = np.lib.format.open_memmap(
+            temporary,
+            mode="w+",
+            dtype=np.complex64,
+            shape=base_templates.shape,
+        )
+        parameters = radial_colored_block_qr_score_parameters(
+            base_templates,
+            detector.adjusted_template_eigenvalues,
+            orders,
+            m_values,
+            radial_points,
+            noise_psd,
+            floor_fraction=floor_fraction,
+            output=output,
+        )
+        (
+            detector.score_templates,
+            detector.score_weights,
+            detector.score_offset,
+            detector.adjusted_template_eigenvalues,
+        ) = parameters
+        detector.template_normalization = np.ones(
+            detector.score_weights.shape, dtype=np.float32
+        )
+        output.flush()
+        detector.score_templates = None
+        del output
+        os.replace(temporary, path)
+        detector.score_templates = np.load(
+            path,
+            mmap_mode="r",
+            allow_pickle=False,
+        )
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def run_stage(name: str, function: Callable[[], T]) -> tuple[T, float]:
     """Run one named stage with visible start, success, and timing logs."""
     LOGGER.info("=" * 72)
@@ -555,6 +645,11 @@ def evaluate_recall(
         "returned_pick_count": int(predicted.shape[0]),
         "matched_ground_truth_count": int(matched_count),
         "recall": float(matched_count / truth_zyx.shape[0]),
+        "precision": (
+            None
+            if predicted.shape[0] == 0
+            else float(matched_count / predicted.shape[0])
+        ),
         "match_radius_voxels": float(match_radius_voxels),
         "mean_matched_distance_voxels": (
             None if not matched_count else float(np.mean(matched[:, -1]))
@@ -654,8 +749,11 @@ def main() -> None:
     """Run the complete checkpointed experiment and report recall."""
     args = parse_args()
     args.results_dir = args.results_dir.resolve()
+    score_artifact_suffix = (
+        "" if args.score_noise_model == "scalar" else "_radialcolored"
+    )
     log_file = (
-        args.results_dir / "empiar-10045.log"
+        args.results_dir / f"empiar-10045{score_artifact_suffix}.log"
         if args.log_file is None
         else args.log_file.resolve()
     )
@@ -670,12 +768,19 @@ def main() -> None:
     LOGGER.info("Initializing input metadata and JAX devices")
 
     try:
+        if (
+            args.colored_noise_floor_fraction <= 0
+            or not np.isfinite(args.colored_noise_floor_fraction)
+        ):
+            raise ValueError("--colored-noise-floor-fraction must be positive")
         if not args.input.is_file():
             raise FileNotFoundError(args.input)
         if not args.ground_truth.is_file():
             raise FileNotFoundError(args.ground_truth)
         args.results_dir.mkdir(parents=True, exist_ok=True)
-        previous_evaluation = args.results_dir / "09_evaluation.json"
+        previous_evaluation = args.results_dir / (
+            f"09_evaluation{score_artifact_suffix}.json"
+        )
         if args.resume and previous_evaluation.is_file():
             with previous_evaluation.open() as stream:
                 previous = json.load(stream)
@@ -769,6 +874,10 @@ def main() -> None:
                 "bandpass_low_fraction": args.bandpass_low_fraction,
                 "bandpass_high_fraction": args.bandpass_high_fraction,
                 "score_basis": "distributed_block_qr_nonnegative_m_v4",
+                "score_noise_model": args.score_noise_model,
+                "colored_noise_floor_fraction": (
+                    args.colored_noise_floor_fraction
+                ),
                 "template_side": detector.model.template_side,
                 "fredholm_radius_voxels": detector.model.fredholm_radius_voxels,
                 "max_order": detector.model.max_order,
@@ -785,7 +894,10 @@ def main() -> None:
                 "match_radius_angstrom": match_radius_angstrom,
                 "match_radius_voxels": match_radius_voxels,
             }
-            save_json(manifest, args.results_dir / "00_manifest.json")
+            save_json(
+                manifest,
+                args.results_dir / f"00_manifest{score_artifact_suffix}.json",
+            )
             save_npy(truth_zyx, args.results_dir / "00_ground_truth_zyx.npy")
             save_csv(
                 truth_zyx[:, ::-1],
@@ -1270,6 +1382,115 @@ def main() -> None:
                         detector.whitened_model.noise_variance
                     ),
                 )
+
+            if args.score_noise_model == "radial-colored":
+                base_signal_eigenvalues = np.asarray(
+                    detector.adjusted_template_eigenvalues,
+                    dtype=np.float64,
+                ).copy()
+                colored_templates_path = (
+                    args.results_dir / "06c_radial_colored_score_templates.npy"
+                )
+                colored_model_path = (
+                    args.results_dir / "06c_radial_colored_score_model.npz"
+                )
+                empirical_noise_psd, empirical_noise_variance = (
+                    estimate_low_variance_noise_rpsd(detector.whitened_rpsds)
+                )
+                LOGGER.info(
+                    "Experimental radial-colored likelihood | quiet-patch "
+                    "variance=%.8g | PSD floor fraction=%.6g",
+                    empirical_noise_variance,
+                    args.colored_noise_floor_fraction,
+                )
+                log_array("Empirical residual noise PSD", empirical_noise_psd)
+                colored_compatible = False
+                if colored_model_path.is_file():
+                    with np.load(colored_model_path, allow_pickle=False) as model:
+                        colored_compatible = (
+                            "method" in model
+                            and model["method"].item() == _COLORED_SCORE_MODEL_METHOD
+                            and "noise_psd" in model
+                            and np.allclose(model["noise_psd"], empirical_noise_psd)
+                            and "floor_fraction" in model
+                            and np.isclose(
+                                model["floor_fraction"].item(),
+                                args.colored_noise_floor_fraction,
+                            )
+                            and "base_signal_eigenvalues" in model
+                            and np.allclose(
+                                model["base_signal_eigenvalues"],
+                                base_signal_eigenvalues,
+                            )
+                        )
+                if (
+                    args.resume
+                    and colored_templates_path.is_file()
+                    and colored_model_path.is_file()
+                    and colored_compatible
+                ):
+                    LOGGER.info(
+                        "STAGE RESUME | radial-colored score model | loading %s",
+                        colored_model_path,
+                    )
+                    detector.score_templates = np.load(
+                        colored_templates_path, mmap_mode="r", allow_pickle=False
+                    )
+                    with np.load(colored_model_path, allow_pickle=False) as model:
+                        detector.template_normalization = model[
+                            "template_normalization"
+                        ].copy()
+                        detector.score_weights = model["score_weights"].copy()
+                        detector.score_offset = np.float32(model["score_offset"])
+                        detector.adjusted_template_eigenvalues = model[
+                            "adjusted_template_eigenvalues"
+                        ].copy()
+                    score_model_recomputed = False
+                else:
+                    if (
+                        args.resume
+                        and colored_model_path.is_file()
+                        and not colored_compatible
+                    ):
+                        if not args.overwrite:
+                            raise RuntimeError(
+                                "radial-colored score checkpoint is incompatible; "
+                                "pass --resume --overwrite to rebuild stage 6c onward"
+                            )
+                    require_replaceable(
+                        (colored_templates_path, colored_model_path),
+                        overwrite=args.overwrite,
+                    )
+                    base_templates = detector.score_templates
+                    score_model_recomputed = True
+                    run_stage(
+                        "6c/8 experimental radial-colored likelihood model",
+                        lambda: prepare_radial_colored_score_checkpoint(
+                            detector,
+                            base_templates,
+                            detector.whitened_rpsds.radial_points,
+                            empirical_noise_psd,
+                            args.colored_noise_floor_fraction,
+                            colored_templates_path,
+                        ),
+                    )
+                    save_npz(
+                        colored_model_path,
+                        method=np.asarray(_COLORED_SCORE_MODEL_METHOD),
+                        template_normalization=detector.template_normalization,
+                        score_weights=detector.score_weights,
+                        score_offset=np.asarray(detector.score_offset),
+                        adjusted_template_eigenvalues=(
+                            detector.adjusted_template_eigenvalues
+                        ),
+                        base_signal_eigenvalues=base_signal_eigenvalues,
+                        noise_psd=empirical_noise_psd,
+                        noise_variance=np.asarray(empirical_noise_variance),
+                        floor_fraction=np.asarray(
+                            args.colored_noise_floor_fraction
+                        ),
+                    )
+                score_templates_path = colored_templates_path
             if args.skip_raw_template_checkpoint and detector.templates is not None:
                 detector.templates = None
                 LOGGER.info("Released raw pre-QR template bank from host RAM")
@@ -1315,6 +1536,8 @@ def main() -> None:
             LOGGER.info("KLT likelihood offset: %.8g", detector.score_offset)
 
             candidate_tag = f"top{args.candidate_capacity_per_subvolume}"
+            if args.score_noise_model == "radial-colored":
+                candidate_tag = f"radialcolored_{candidate_tag}"
             candidates_path = args.results_dir / f"07_candidates_{candidate_tag}.npy"
             score_plan_path = args.results_dir / f"07_score_plan_{candidate_tag}.json"
             candidates_recomputed = False
@@ -1384,7 +1607,8 @@ def main() -> None:
             particles_xyz_score = detector.particles[:, [2, 1, 0, 3]]
             save_csv(
                 particles_xyz_score,
-                args.results_dir / "08_particles_xyz.csv",
+                args.results_dir
+                / f"08_particles_xyz{score_artifact_suffix}.csv",
                 header="x,y,z,normalized_score",
             )
             LOGGER.info(
@@ -1431,7 +1655,8 @@ def main() -> None:
                 record_stage_time(stage_times, "positive_score_global_nms", elapsed)
             save_csv(
                 positive_particles[:, [2, 1, 0, 3]],
-                args.results_dir / "08_positive_particles_xyz.csv",
+                args.results_dir
+                / f"08_positive_particles_xyz{score_artifact_suffix}.csv",
                 header="x,y,z,raw_score",
             )
             LOGGER.info(
@@ -1459,10 +1684,13 @@ def main() -> None:
             time.perf_counter() - started
         ) / 60
         evaluation["stage_runtime_seconds"] = stage_times
-        save_json(evaluation, args.results_dir / "09_evaluation.json")
+        save_json(
+            evaluation,
+            args.results_dir / f"09_evaluation{score_artifact_suffix}.json",
+        )
         save_csv(
             matches,
-            args.results_dir / "09_matches.csv",
+            args.results_dir / f"09_matches{score_artifact_suffix}.csv",
             header=(
                 "prediction_index,truth_index,pred_z,pred_y,pred_x,"
                 "truth_z,truth_y,truth_x,distance_voxels"
@@ -1470,7 +1698,7 @@ def main() -> None:
         )
         save_csv(
             top_n_matches,
-            args.results_dir / "09_top_n_matches.csv",
+            args.results_dir / f"09_top_n_matches{score_artifact_suffix}.csv",
             header=(
                 "prediction_index,truth_index,pred_z,pred_y,pred_x,"
                 "truth_z,truth_y,truth_x,distance_voxels"
@@ -1485,16 +1713,17 @@ def main() -> None:
                 "top_n_matches": top_n_matches,
                 "evaluation": evaluation,
             },
-            args.results_dir / "09_final_result.pkl",
+            args.results_dir / f"09_final_result{score_artifact_suffix}.pkl",
         )
         LOGGER.info("=" * 72)
         LOGGER.info(
-            "FINAL POSITIVE-SCORE RECALL | picks=%d | matched=%d / truth=%d | "
-            "recall=%.4f",
+            "FINAL POSITIVE-SCORE METRICS | picks=%d | matched=%d / truth=%d | "
+            "recall=%.4f | precision=%.4f",
             evaluation["returned_pick_count"],
             evaluation["matched_ground_truth_count"],
             evaluation["ground_truth_count"],
             evaluation["recall"],
+            evaluation["precision"] or 0.0,
         )
         LOGGER.info(
             "TOP-%d REFERENCE RECALL | matched=%d / truth=%d | recall=%.4f",
@@ -1505,7 +1734,8 @@ def main() -> None:
         )
         LOGGER.info(
             "Coordinates: %s",
-            args.results_dir / "08_particles_xyz.csv",
+            args.results_dir
+            / f"08_particles_xyz{score_artifact_suffix}.csv",
         )
         LOGGER.info(
             "Experiment completed in %.2f minutes | results=%s",

@@ -13,14 +13,17 @@ from kltpicker_3d.multi_gpu import (
     construct_klt_score_filters,
     distributed_block_qr_score_parameters,
     extract_score_candidates,
+    estimate_low_variance_noise_rpsd,
     next_cufft_fast_length,
     orthogonal_klt_score_parameters,
     plan_cufft_fft_shape,
     plan_template_fft_batch,
+    radial_colored_block_qr_score_parameters,
+    radial_noise_inverse_sqrt_multiplier,
     ranked_candidate_nms_3d,
     validate_active_score_templates,
 )
-from kltpicker_3d.streaming import ArrayVolumeSource
+from kltpicker_3d.streaming import ArrayVolumeSource, RpsdExtractionResult
 from kltpicker_3d.utils import construct_finite_bandpass_filter
 
 
@@ -37,6 +40,77 @@ def test_finite_bandpass_rejects_constant_and_has_bounded_support():
     grid = np.indices(kernel.shape) - 3
     outside = np.sum(grid**2, axis=0) > 3**2
     assert_array_equal(kernel[outside], 0)
+
+
+def test_low_variance_noise_rpsd_uses_quiet_patch_population():
+    extraction = RpsdExtractionResult(
+        rpsds=np.array([[1, 1, 1], [2, 2, 2], [20, 20, 20], [30, 30, 30]]),
+        variances=np.array([1, 2, 20, 30]),
+        radial_points=np.array([0, np.pi / 2, np.pi]),
+        patch_grid_shape=(1, 1, 4),
+        patch_size=3,
+    )
+    noise_psd, variance = estimate_low_variance_noise_rpsd(
+        extraction, fraction=0.5
+    )
+    assert_allclose(variance, 1.5)
+    from kltpicker_3d.utils import radial_psd_to_variance
+    assert_allclose(
+        radial_psd_to_variance(extraction.radial_points, noise_psd),
+        variance,
+    )
+
+
+def test_radial_colored_score_matches_dense_gaussian_quadratic():
+    rng = np.random.default_rng(81)
+    shape = (3, 3, 3)
+    templates = (
+        rng.standard_normal((2, *shape))
+        + 1j * rng.standard_normal((2, *shape))
+    ).astype(np.complex64)
+    eigenvalues = np.array([1.2, 0.4])
+    points = np.array([0.0, np.pi / 2, np.pi])
+    noise_psd = np.array([0.5, 1.0, 2.0])
+    filters, weights, offset, _ = radial_colored_block_qr_score_parameters(
+        templates,
+        eigenvalues,
+        np.zeros(2, dtype=np.int64),
+        np.zeros(2, dtype=np.int64),
+        points,
+        noise_psd,
+        floor_fraction=1e-6,
+    )
+    multiplier = radial_noise_inverse_sqrt_multiplier(
+        points, noise_psd, shape, floor_fraction=1e-6
+    )
+    voxel_count = int(np.prod(shape))
+    # Materialize W by applying it to voxel basis vectors.
+    identity = np.eye(voxel_count).reshape(voxel_count, *shape)
+    from kltpicker_3d.multi_gpu import _apply_fourier_multiplier
+    whitening = _apply_fourier_multiplier(identity, multiplier).reshape(
+        voxel_count, voxel_count
+    ).T
+    inverse_whitening = np.linalg.inv(whitening)
+    noise_covariance = inverse_whitening @ inverse_whitening.conj().T
+    template_matrix = templates.reshape(2, voxel_count).T
+    signal_covariance = (
+        template_matrix * eigenvalues[None, :]
+    ) @ template_matrix.conj().T
+    sample = rng.standard_normal(voxel_count)
+    inverse_difference = np.linalg.inv(noise_covariance) - np.linalg.inv(
+        noise_covariance + signal_covariance
+    )
+    determinant_difference = (
+        np.linalg.slogdet(noise_covariance + signal_covariance)[1]
+        - np.linalg.slogdet(noise_covariance)[1]
+    )
+    dense = (
+        np.real(sample.conj() @ inverse_difference @ sample)
+        - determinant_difference
+    )
+    responses = filters.reshape(2, voxel_count).conj() @ sample
+    compact = np.sum(weights * np.abs(responses) ** 2) - offset
+    assert_allclose(compact, dense, rtol=2e-4, atol=2e-4)
 
 
 def test_candidate_top_k_reports_full_count_and_retains_only_capacity():

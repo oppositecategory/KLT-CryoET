@@ -13,6 +13,7 @@ executed.  A full top-10N run writes tens of GiB even after rescaling.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 import json
 import os
 from pathlib import Path
@@ -30,13 +31,23 @@ DEFAULT_CANDIDATES = Path(
     "ranked_nms_0.5D_top10N.npy"
 )
 DEFAULT_OUTPUT = Path("results/empiar-10045-relion-legacy")
-TOMOGRAM_NAME = "IS002_291013_008"
+DEFAULT_TOMOGRAM_ID = "08"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--candidates", type=Path, default=DEFAULT_CANDIDATES)
+    parser.add_argument(
+        "--tomogram",
+        action="append",
+        nargs=2,
+        metavar=("ID", "CANDIDATES"),
+        help=(
+            "Tomogram ID and candidate NPY path. Repeat for a multi-tomogram "
+            "dataset. When omitted, --candidates is used for tomogram 08."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--box-size", type=int, default=200)
     parser.add_argument(
@@ -111,6 +122,7 @@ def deposited_defocus_per_tilt(
     ctf_star: Path,
     tilts: np.ndarray,
     low_tilt_limit: float,
+    tomogram_name: str,
 ) -> np.ndarray:
     labels, rows = read_star_table(ctf_star)
     try:
@@ -119,7 +131,7 @@ def deposited_defocus_per_tilt(
     except ValueError as error:
         raise ValueError(f"missing required label in {ctf_star}: {error}") from error
 
-    rows = [row for row in rows if TOMOGRAM_NAME in row[name_column]]
+    rows = [row for row in rows if tomogram_name in row[name_column]]
     defocus_u = np.asarray(
         [float(row[defocus_column]) for row in rows], dtype=np.float64
     )
@@ -228,10 +240,9 @@ def write_particle_ctf_star(
 
 def write_particles_star(
     path: Path,
-    candidates: np.ndarray,
-    tomogram_relative: Path,
-    extract_root: Path,
-    ctf_root: Path,
+    particle_sets: Sequence[
+        tuple[np.ndarray, Path, Path, Path, str]
+    ],
     image_pixel_size: float,
     image_size: int,
 ) -> None:
@@ -261,14 +272,21 @@ def write_particles_star(
             "_rlnOpticsGroup #7\n"
             "_rlnAutopickFigureOfMerit #8\n"
         )
-        for index, (z, y, x, score) in enumerate(candidates, start=1):
-            suffix = f"{index:06d}"
-            particle = extract_root / f"{TOMOGRAM_NAME}{suffix}.mrc"
-            ctf = ctf_root / f"{TOMOGRAM_NAME}_ctf{suffix}.mrc"
-            output.write(
-                f"{tomogram_relative} {x:.6f} {y:.6f} {z:.6f} "
-                f"{particle} {ctf} 1 {score:.9g}\n"
-            )
+        for (
+            candidates,
+            tomogram_relative,
+            extract_root,
+            ctf_root,
+            tomogram_name,
+        ) in particle_sets:
+            for index, (z, y, x, score) in enumerate(candidates, start=1):
+                suffix = f"{index:06d}"
+                particle = extract_root / f"{tomogram_name}{suffix}.mrc"
+                ctf = ctf_root / f"{tomogram_name}_ctf{suffix}.mrc"
+                output.write(
+                    f"{tomogram_relative} {x:.6f} {y:.6f} {z:.6f} "
+                    f"{particle} {ctf} 1 {score:.9g}\n"
+                )
 
 
 def write_run_scripts(
@@ -307,7 +325,7 @@ def write_run_scripts(
         'JOBS="${JOBS:-4}"\n'
         "export RELION_BIN_DIR\n"
         'cd "$(dirname "$0")"\n'
-        "find Particles/Tomograms/08 -name '*_ctf??????.star' -print0 | "
+        "find Particles/Tomograms -name '*_ctf??????.star' -print0 | "
         "sort -z | xargs -0 -r -n 1 -P \"${JOBS}\" bash -c '\n"
         "  set -euo pipefail\n"
         "  input=\"$1\"\n"
@@ -334,75 +352,159 @@ def main() -> None:
     if args.scaled_size > args.box_size:
         raise ValueError("scaled size cannot exceed extraction box size")
 
-    candidates = np.asarray(np.load(require_file(args.candidates)), dtype=np.float64)
-    if candidates.ndim != 2 or candidates.shape[1] != 4:
-        raise ValueError("candidates must have (z, y, x, score) columns")
-    if not np.all(np.isfinite(candidates)):
-        raise ValueError("candidates contain non-finite values")
-    if np.any(np.diff(candidates[:, 3]) > 0):
-        raise ValueError("candidates are not sorted by descending score")
-    if args.max_picks is not None:
-        if args.max_picks < 1:
-            raise ValueError("max picks must be positive")
-        candidates = candidates[: args.max_picks]
-
-    source_tomogram_dir = args.dataset_root / "Tomograms" / "08"
-    source_anticipated = args.dataset_root / "AnticipatedResults"
-    source_base = source_tomogram_dir / TOMOGRAM_NAME
-    source_files = {
-        suffix: require_file(source_base.with_suffix(suffix))
-        for suffix in (".mrc", ".mrcs", ".order", ".tlt", ".trial")
-    }
-    source_ctf = require_file(
-        source_anticipated
-        / "Tomograms"
-        / "08"
-        / "ctffind"
-        / f"{TOMOGRAM_NAME}_ctffind.star"
-    )
-
-    with mrcfile.open(source_files[".mrc"], permissive=True, header_only=True) as mrc:
-        tomogram_zyx = (int(mrc.header.nz), int(mrc.header.ny), int(mrc.header.nx))
-        header_pixel_size = float(mrc.voxel_size.x)
-    with mrcfile.open(source_files[".mrcs"], permissive=True, header_only=True) as mrc:
-        tilt_stack_zyx = (int(mrc.header.nz), int(mrc.header.ny), int(mrc.header.nx))
-
-    coordinates = candidates[:, :3]
-    if np.any(coordinates < 0) or np.any(coordinates >= np.asarray(tomogram_zyx)):
-        raise ValueError("candidate coordinate lies outside the tomogram")
-    half_box = args.box_size // 2
-    full_box = np.all(
-        (coordinates >= half_box)
-        & (coordinates < np.asarray(tomogram_zyx) - half_box),
-        axis=1,
-    )
-
-    tilts = np.atleast_1d(np.loadtxt(source_files[".tlt"], dtype=np.float64))
-    order = np.atleast_2d(np.loadtxt(source_files[".order"], dtype=np.float64))
-    if tilt_stack_zyx[0] != tilts.size:
-        raise ValueError(
-            f"tilt stack has {tilt_stack_zyx[0]} images but .tlt has {tilts.size} rows"
-        )
-    base_defocus = deposited_defocus_per_tilt(
-        source_ctf, tilts, args.low_tilt_limit
-    )
-    dose_bfactor = matched_doses(tilts, order) * args.dose_bfactor
-
     output_dir = args.output_dir.resolve()
-    tomo_dir = output_dir / "Tomograms" / "08"
-    ctf_dir = output_dir / "Particles" / "Tomograms" / "08"
-    extract_dir = output_dir / "Extract" / "top10n" / "Tomograms" / "08"
-    for directory in (tomo_dir, ctf_dir, extract_dir):
-        directory.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.max_picks is not None and args.max_picks < 1:
+        raise ValueError("max picks must be positive")
+    raw_specs = args.tomogram or [(DEFAULT_TOMOGRAM_ID, str(args.candidates))]
+    if len({spec[0] for spec in raw_specs}) != len(raw_specs):
+        raise ValueError("tomogram IDs must be unique")
 
-    for suffix, source in source_files.items():
-        replace_symlink(tomo_dir / f"{TOMOGRAM_NAME}{suffix}", source)
+    particle_sets: list[tuple[np.ndarray, Path, Path, Path, str]] = []
+    tomogram_rows: list[str] = []
+    manifest_tomograms: list[dict[str, object]] = []
+    total_candidates = 0
+    total_complete_boxes = 0
+    source_anticipated = args.dataset_root / "AnticipatedResults"
+    half_box = args.box_size // 2
 
-    coordinate_star = tomo_dir / f"{TOMOGRAM_NAME}_top10n.star"
-    write_coordinate_star(coordinate_star, candidates)
-    write_coordinate_text(tomo_dir / f"{TOMOGRAM_NAME}.coords", candidates)
+    for raw_id, raw_candidate_path in raw_specs:
+        try:
+            tomogram_number = int(raw_id)
+        except ValueError as error:
+            raise ValueError(f"invalid numeric tomogram ID: {raw_id}") from error
+        tomogram_id = f"{tomogram_number:02d}"
+        tomogram_name = f"IS002_291013_{tomogram_number:03d}"
+        candidate_path = require_file(Path(raw_candidate_path))
+        candidates = np.asarray(np.load(candidate_path), dtype=np.float64)
+        if candidates.ndim != 2 or candidates.shape[1] != 4:
+            raise ValueError(
+                f"{candidate_path}: candidates must have (z, y, x, score) columns"
+            )
+        if not np.all(np.isfinite(candidates)):
+            raise ValueError(f"{candidate_path}: candidates contain non-finite values")
+        if np.any(np.diff(candidates[:, 3]) > 0):
+            raise ValueError(
+                f"{candidate_path}: candidates are not sorted by descending score"
+            )
+        if args.max_picks is not None:
+            candidates = candidates[: args.max_picks]
 
-    tomogram_relative = Path("Tomograms/08") / f"{TOMOGRAM_NAME}.mrc"
+        source_base = args.dataset_root / "Tomograms" / tomogram_id / tomogram_name
+        source_files = {
+            suffix: require_file(source_base.with_suffix(suffix))
+            for suffix in (".mrc", ".mrcs", ".order", ".tlt", ".trial")
+        }
+        source_ctf = require_file(
+            source_anticipated
+            / "Tomograms"
+            / tomogram_id
+            / "ctffind"
+            / f"{tomogram_name}_ctffind.star"
+        )
+        with mrcfile.open(
+            source_files[".mrc"], permissive=True, header_only=True
+        ) as mrc:
+            tomogram_zyx = (
+                int(mrc.header.nz),
+                int(mrc.header.ny),
+                int(mrc.header.nx),
+            )
+            header_pixel_size = float(mrc.voxel_size.x)
+        with mrcfile.open(
+            source_files[".mrcs"], permissive=True, header_only=True
+        ) as mrc:
+            tilt_stack_zyx = (
+                int(mrc.header.nz),
+                int(mrc.header.ny),
+                int(mrc.header.nx),
+            )
+
+        coordinates = candidates[:, :3]
+        if np.any(coordinates < 0) or np.any(
+            coordinates >= np.asarray(tomogram_zyx)
+        ):
+            raise ValueError(f"tomogram {tomogram_id}: candidate lies outside volume")
+        full_box = np.all(
+            (coordinates >= half_box)
+            & (coordinates < np.asarray(tomogram_zyx) - half_box),
+            axis=1,
+        )
+        tilts = np.atleast_1d(np.loadtxt(source_files[".tlt"], dtype=np.float64))
+        order = np.atleast_2d(np.loadtxt(source_files[".order"], dtype=np.float64))
+        if tilt_stack_zyx[0] != tilts.size:
+            raise ValueError(
+                f"tomogram {tomogram_id}: tilt stack has {tilt_stack_zyx[0]} "
+                f"images but .tlt has {tilts.size} rows"
+            )
+        base_defocus = deposited_defocus_per_tilt(
+            source_ctf,
+            tilts,
+            args.low_tilt_limit,
+            tomogram_name,
+        )
+        dose_bfactor = matched_doses(tilts, order) * args.dose_bfactor
+
+        tomo_dir = output_dir / "Tomograms" / tomogram_id
+        ctf_dir = output_dir / "Particles" / "Tomograms" / tomogram_id
+        extract_dir = output_dir / "Extract" / "top10n" / "Tomograms" / tomogram_id
+        for directory in (tomo_dir, ctf_dir, extract_dir):
+            directory.mkdir(parents=True, exist_ok=True)
+        for suffix, source in source_files.items():
+            replace_symlink(tomo_dir / f"{tomogram_name}{suffix}", source)
+        write_coordinate_star(
+            tomo_dir / f"{tomogram_name}_top10n.star",
+            candidates,
+        )
+        write_coordinate_text(tomo_dir / f"{tomogram_name}.coords", candidates)
+
+        tomogram_relative = (
+            Path("Tomograms") / tomogram_id / f"{tomogram_name}.mrc"
+        )
+        xyz = candidates[:, [2, 1, 0]]
+        per_particle_defocus = particle_defocus(
+            xyz,
+            tilts,
+            base_defocus,
+            (tomogram_zyx[2], tomogram_zyx[1], tomogram_zyx[0]),
+            args.legacy_pixel_size,
+        )
+        for index, defocus in enumerate(per_particle_defocus, start=1):
+            write_particle_ctf_star(
+                ctf_dir / f"{tomogram_name}_ctf{index:06d}.star",
+                tilts,
+                defocus,
+                dose_bfactor,
+            )
+        particle_sets.append(
+            (
+                candidates,
+                tomogram_relative,
+                Path("Extract/top10n/Tomograms") / tomogram_id,
+                Path("Particles/Tomograms") / tomogram_id,
+                tomogram_name,
+            )
+        )
+        tomogram_rows.append(f"{tomogram_relative} 1")
+        candidate_count = int(candidates.shape[0])
+        complete_count = int(np.sum(full_box))
+        total_candidates += candidate_count
+        total_complete_boxes += complete_count
+        manifest_tomograms.append(
+            {
+                "id": tomogram_id,
+                "name": tomogram_name,
+                "candidate_source": str(candidate_path),
+                "candidate_count": candidate_count,
+                "complete_unpadded_box_count": complete_count,
+                "boundary_padded_box_count": candidate_count - complete_count,
+                "tomogram_shape_zyx": list(tomogram_zyx),
+                "tilt_stack_shape_zyx": list(tilt_stack_zyx),
+                "tilt_count": int(tilts.size),
+                "tomogram_header_pixel_size_angstrom": header_pixel_size,
+            }
+        )
+
     (output_dir / "all_tomograms.star").write_text(
         "data_optics\n\n"
         "loop_\n"
@@ -417,31 +519,12 @@ def main() -> None:
         "loop_\n"
         "_rlnMicrographName #1\n"
         "_rlnOpticsGroup #2\n"
-        f"{tomogram_relative} 1\n"
+        + "\n".join(tomogram_rows)
+        + "\n"
     )
-
-    xyz = candidates[:, [2, 1, 0]]
-    per_particle_defocus = particle_defocus(
-        xyz,
-        tilts,
-        base_defocus,
-        (tomogram_zyx[2], tomogram_zyx[1], tomogram_zyx[0]),
-        args.legacy_pixel_size,
-    )
-    for index, defocus in enumerate(per_particle_defocus, start=1):
-        write_particle_ctf_star(
-            ctf_dir / f"{TOMOGRAM_NAME}_ctf{index:06d}.star",
-            tilts,
-            defocus,
-            dose_bfactor,
-        )
-
     write_particles_star(
         output_dir / "particles_subtomo.star",
-        candidates,
-        tomogram_relative,
-        Path("Extract/top10n/Tomograms/08"),
-        Path("Particles/Tomograms/08"),
+        particle_sets,
         args.legacy_pixel_size * args.box_size / args.scaled_size,
         args.scaled_size,
     )
@@ -452,26 +535,22 @@ def main() -> None:
         args.legacy_pixel_size,
     )
 
-    particle_bytes = candidates.shape[0] * args.scaled_size**3 * 4
-    ctf_bytes = candidates.shape[0] * args.scaled_size**3 * 4
+    particle_bytes = total_candidates * args.scaled_size**3 * 4
+    ctf_bytes = total_candidates * args.scaled_size**3 * 4
     temporary_ctf_bytes = args.box_size**3 * 4
     manifest = {
-        "candidate_source": str(args.candidates.resolve()),
-        "candidate_count": int(candidates.shape[0]),
+        "tomograms": manifest_tomograms,
+        "candidate_count": total_candidates,
         "candidate_columns": ["z", "y", "x", "score"],
         "relion_coordinate_order": ["x", "y", "z"],
-        "complete_unpadded_box_count": int(np.sum(full_box)),
-        "boundary_padded_box_count": int(np.sum(~full_box)),
-        "tomogram_shape_zyx": list(tomogram_zyx),
-        "tilt_stack_shape_zyx": list(tilt_stack_zyx),
-        "tilt_count": int(tilts.size),
+        "complete_unpadded_box_count": total_complete_boxes,
+        "boundary_padded_box_count": total_candidates - total_complete_boxes,
         "box_size": args.box_size,
         "scaled_size": args.scaled_size,
         "legacy_pixel_size_angstrom": args.legacy_pixel_size,
         "scaled_pixel_size_angstrom": (
             args.legacy_pixel_size * args.box_size / args.scaled_size
         ),
-        "tomogram_header_pixel_size_angstrom": header_pixel_size,
         "particle_diameter_angstrom": args.particle_diameter,
         "low_tilt_limit_degrees": args.low_tilt_limit,
         "dose_bfactor_per_electron_per_angstrom2": args.dose_bfactor,
@@ -485,10 +564,13 @@ def main() -> None:
     }
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
-    print(f"Prepared {candidates.shape[0]:,} ranked picks in {output_dir}")
     print(
-        f"Complete {args.box_size}^3 boxes: {np.sum(full_box):,}; "
-        f"boundary-padded boxes: {np.sum(~full_box):,}"
+        f"Prepared {total_candidates:,} ranked picks from "
+        f"{len(particle_sets)} tomograms in {output_dir}"
+    )
+    print(
+        f"Complete {args.box_size}^3 boxes: {total_complete_boxes:,}; "
+        f"boundary-padded boxes: {total_candidates - total_complete_boxes:,}"
     )
     print(
         f"Scaled particle storage estimate: {particle_bytes / 2**30:.1f} GiB; "
