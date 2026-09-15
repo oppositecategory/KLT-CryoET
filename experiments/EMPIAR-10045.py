@@ -26,7 +26,12 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from kltpicker_3d.fredholm_solver import INVERSE_FOURIER_NORMALIZATION_3D
-from kltpicker_3d.multi_gpu import MultiGPUKLTParticleDetector3D
+from kltpicker_3d.multi_gpu import (
+    MultiGPUKLTParticleDetector3D,
+    estimate_low_variance_noise_rpsd,
+    radial_colored_block_qr_score_parameters,
+    ranked_candidate_nms_3d,
+)
 from kltpicker_3d.streaming import MrcVolumeSource
 
 # DATASET_ROOT = Path(
@@ -52,7 +57,9 @@ DEFAULT_RESULTS_DIR = REPOSITORY_ROOT / "results/empiar-10045-bandpass-block-qr"
 
 LOGGER = logging.getLogger("empiar-10045")
 T = TypeVar("T")
-_SCORE_MODEL_METHOD = "block_qr_ell_m_v2_fourier_normalized"
+_TEMPLATE_MODEL_METHOD = "linear_mass_preserving_psd_v2"
+_SCORE_MODEL_METHOD = "block_qr_nonnegative_m_v4_mass_preserving_psd"
+_COLORED_SCORE_MODEL_METHOD = "radial_colored_circulant_block_qr_v1"
 
 
 def parse_args() -> argparse.Namespace:
@@ -123,6 +130,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--template-energy-fraction", type=float, default=0.99)
     parser.add_argument("--max-templates", type=int, default=1000)
+    parser.add_argument(
+        "--skip-raw-template-checkpoint",
+        action="store_true",
+        help=(
+            "Keep the pre-QR template bank only in host RAM and checkpoint "
+            "only its metadata and the final block-QR bank. This avoids "
+            "temporarily requiring disk space for two large template banks."
+        ),
+    )
     parser.add_argument("--max-iterations", type=int, default=500)
     parser.add_argument(
         "--threshold",
@@ -134,7 +150,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--template-side", type=int)
     parser.add_argument("--nms-radius", type=float)
     parser.add_argument("--score-template-batch-size", type=int)
+    parser.add_argument(
+        "--score-template-chunk-size",
+        type=int,
+        help="Compact templates resident per GPU while streaming score shards.",
+    )
     parser.add_argument("--score-memory-fraction", type=float, default=0.8)
+    parser.add_argument(
+        "--score-noise-model",
+        choices=("scalar", "radial-colored"),
+        default="scalar",
+        help=(
+            "Likelihood noise covariance. The experimental radial-colored "
+            "model estimates the residual spectrum from the quietest 25%% "
+            "of already-whitened patches."
+        ),
+    )
+    parser.add_argument(
+        "--colored-noise-floor-fraction",
+        type=float,
+        default=0.1,
+        help="PSD floor relative to the positive median for radial-colored scoring.",
+    )
+    parser.add_argument(
+        "--score-fft-shape",
+        type=int,
+        nargs=3,
+        metavar=("Z", "Y", "X"),
+        help="Override automatic cuFFT-friendly scoring dimensions.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -342,16 +386,92 @@ def prepare_block_qr_checkpoint(
     temporary_stream.close()
     try:
         template_array = np.asanyarray(templates)
+        if detector.model.template_m_values is None:
+            raise RuntimeError("template m values have not been initialized")
+        representative_count = int(
+            np.count_nonzero(detector.model.template_m_values >= 0)
+        )
         output = np.lib.format.open_memmap(
             temporary,
             mode="w+",
             dtype=np.complex64,
-            shape=template_array.shape,
+            shape=(representative_count, *template_array.shape[1:]),
         )
         detector.prepare_score_filters(
             template_array,
             noise_variance,
             output=output,
+        )
+        output.flush()
+        detector.score_templates = None
+        del output
+        os.replace(temporary, path)
+        detector.score_templates = np.load(
+            path,
+            mmap_mode="r",
+            allow_pickle=False,
+        )
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def prepare_radial_colored_score_checkpoint(
+    detector: MultiGPUKLTParticleDetector3D,
+    base_templates: npt.ArrayLike,
+    radial_points: npt.ArrayLike,
+    noise_psd: npt.ArrayLike,
+    floor_fraction: float,
+    path: Path,
+) -> None:
+    """Build experimental colored-noise filters into an atomic NPY file."""
+    if detector.adjusted_template_eigenvalues is None:
+        raise RuntimeError("base block-QR signal eigenvalues are unavailable")
+    if detector.score_template_indices is None:
+        raise RuntimeError("base score-template indices are unavailable")
+    if (
+        detector.model.template_orders is None
+        or detector.model.template_m_values is None
+    ):
+        raise RuntimeError("template angular metadata is unavailable")
+    indices = detector.score_template_indices
+    orders = np.asarray(detector.model.template_orders)[indices]
+    m_values = np.asarray(detector.model.template_m_values)[indices]
+    base_templates = np.asanyarray(base_templates)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_stream = tempfile.NamedTemporaryFile(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    temporary = Path(temporary_stream.name)
+    temporary_stream.close()
+    try:
+        output = np.lib.format.open_memmap(
+            temporary,
+            mode="w+",
+            dtype=np.complex64,
+            shape=base_templates.shape,
+        )
+        parameters = radial_colored_block_qr_score_parameters(
+            base_templates,
+            detector.adjusted_template_eigenvalues,
+            orders,
+            m_values,
+            radial_points,
+            noise_psd,
+            floor_fraction=floor_fraction,
+            output=output,
+        )
+        (
+            detector.score_templates,
+            detector.score_weights,
+            detector.score_offset,
+            detector.adjusted_template_eigenvalues,
+        ) = parameters
+        detector.template_normalization = np.ones(
+            detector.score_weights.shape, dtype=np.float32
         )
         output.flush()
         detector.score_templates = None
@@ -525,6 +645,11 @@ def evaluate_recall(
         "returned_pick_count": int(predicted.shape[0]),
         "matched_ground_truth_count": int(matched_count),
         "recall": float(matched_count / truth_zyx.shape[0]),
+        "precision": (
+            None
+            if predicted.shape[0] == 0
+            else float(matched_count / predicted.shape[0])
+        ),
         "match_radius_voxels": float(match_radius_voxels),
         "mean_matched_distance_voxels": (
             None if not matched_count else float(np.mean(matched[:, -1]))
@@ -624,8 +749,11 @@ def main() -> None:
     """Run the complete checkpointed experiment and report recall."""
     args = parse_args()
     args.results_dir = args.results_dir.resolve()
+    score_artifact_suffix = (
+        "" if args.score_noise_model == "scalar" else "_radialcolored"
+    )
     log_file = (
-        args.results_dir / "empiar-10045.log"
+        args.results_dir / f"empiar-10045{score_artifact_suffix}.log"
         if args.log_file is None
         else args.log_file.resolve()
     )
@@ -640,12 +768,19 @@ def main() -> None:
     LOGGER.info("Initializing input metadata and JAX devices")
 
     try:
+        if (
+            args.colored_noise_floor_fraction <= 0
+            or not np.isfinite(args.colored_noise_floor_fraction)
+        ):
+            raise ValueError("--colored-noise-floor-fraction must be positive")
         if not args.input.is_file():
             raise FileNotFoundError(args.input)
         if not args.ground_truth.is_file():
             raise FileNotFoundError(args.ground_truth)
         args.results_dir.mkdir(parents=True, exist_ok=True)
-        previous_evaluation = args.results_dir / "09_evaluation.json"
+        previous_evaluation = args.results_dir / (
+            f"09_evaluation{score_artifact_suffix}.json"
+        )
         if args.resume and previous_evaluation.is_file():
             with previous_evaluation.open() as stream:
                 previous = json.load(stream)
@@ -710,7 +845,13 @@ def main() -> None:
                 template_side=args.template_side,
                 nms_radius=args.nms_radius,
                 score_template_batch_size=args.score_template_batch_size,
+                score_template_chunk_size=args.score_template_chunk_size,
                 score_memory_fraction=args.score_memory_fraction,
+                score_fft_shape=(
+                    None
+                    if args.score_fft_shape is None
+                    else tuple(args.score_fft_shape)
+                ),
             )
             log_plan(args, detector, voxel_size, header_spacing, truth_count)
             LOGGER.info(
@@ -732,19 +873,31 @@ def main() -> None:
                 "whitening_support_radius": args.whitening_support_radius,
                 "bandpass_low_fraction": args.bandpass_low_fraction,
                 "bandpass_high_fraction": args.bandpass_high_fraction,
-                "score_basis": "distributed_block_qr_by_ell_m_v1",
+                "score_basis": "distributed_block_qr_nonnegative_m_v4",
+                "score_noise_model": args.score_noise_model,
+                "colored_noise_floor_fraction": (
+                    args.colored_noise_floor_fraction
+                ),
                 "template_side": detector.model.template_side,
                 "fredholm_radius_voxels": detector.model.fredholm_radius_voxels,
                 "max_order": detector.model.max_order,
                 "template_energy_fraction": args.template_energy_fraction,
                 "max_templates": args.max_templates,
+                "raw_template_checkpoint": (
+                    not args.skip_raw_template_checkpoint
+                ),
                 "score_template_batch_size": args.score_template_batch_size,
+                "score_template_chunk_size": args.score_template_chunk_size,
                 "score_memory_fraction": args.score_memory_fraction,
+                "score_fft_shape": detector.score_fft_shape,
                 "nms_radius_voxels": detector.model.nms_radius_voxels,
                 "match_radius_angstrom": match_radius_angstrom,
                 "match_radius_voxels": match_radius_voxels,
             }
-            save_json(manifest, args.results_dir / "00_manifest.json")
+            save_json(
+                manifest,
+                args.results_dir / f"00_manifest{score_artifact_suffix}.json",
+            )
             save_npy(truth_zyx, args.results_dir / "00_ground_truth_zyx.npy")
             save_csv(
                 truth_zyx[:, ::-1],
@@ -881,32 +1034,58 @@ def main() -> None:
             template_metadata_path = (
                 args.results_dir / "06_template_metadata.npz"
             )
+            score_templates_path = args.results_dir / "06b_block_qr_templates.npy"
+            score_model_path = args.results_dir / "06b_block_qr_score_model.npz"
             template_checkpoint_compatible = False
             if template_metadata_path.is_file():
                 with np.load(template_metadata_path, allow_pickle=False) as metadata:
                     template_checkpoint_compatible = (
                         "inverse_fourier_normalization_3d" in metadata
+                        and "template_model_method" in metadata
+                        and metadata["template_model_method"].item()
+                        == _TEMPLATE_MODEL_METHOD
                         and np.isclose(
                             metadata["inverse_fourier_normalization_3d"].item(),
                             INVERSE_FOURIER_NORMALIZATION_3D,
                         )
                     )
+            score_checkpoint_compatible = False
+            if score_model_path.is_file():
+                with np.load(score_model_path, allow_pickle=False) as score_model:
+                    score_checkpoint_compatible = (
+                        "method" in score_model
+                        and score_model["method"].item() == _SCORE_MODEL_METHOD
+                        and "score_multiplicities" in score_model
+                        and "score_template_indices" in score_model
+                    )
+            complete_score_checkpoint = (
+                score_templates_path.is_file()
+                and score_model_path.is_file()
+                and score_checkpoint_compatible
+            )
             templates_recomputed = False
             if (
                 args.resume
-                and templates_path.is_file()
                 and template_metadata_path.is_file()
                 and template_checkpoint_compatible
+                and (templates_path.is_file() or complete_score_checkpoint)
             ):
-                LOGGER.info(
-                    "STAGE RESUME | templates | loading %s",
-                    templates_path,
-                )
-                detector.templates = np.load(
-                    templates_path,
-                    mmap_mode="r",
-                    allow_pickle=False,
-                )
+                if templates_path.is_file():
+                    LOGGER.info(
+                        "STAGE RESUME | templates | loading %s",
+                        templates_path,
+                    )
+                    detector.templates = np.load(
+                        templates_path,
+                        mmap_mode="r",
+                        allow_pickle=False,
+                    )
+                else:
+                    LOGGER.info(
+                        "STAGE RESUME | raw templates omitted; loading stage-6 "
+                        "metadata and the completed stage-6b score bank"
+                    )
+                    detector.templates = None
                 elapsed = 0.0
             else:
                 if (
@@ -917,12 +1096,13 @@ def main() -> None:
                 ):
                     if not args.overwrite:
                         raise RuntimeError(
-                            "stage-6 checkpoint uses the legacy Fourier scale; "
+                            "stage-6 checkpoint uses an incompatible template "
+                            "model; "
                             "pass --resume --overwrite to rebuild stage 6 onward"
                         )
                     LOGGER.warning(
-                        "Stage-6 checkpoint predates corrected Fourier "
-                        "normalization; rebuilding templates and eigenvalues"
+                        "Stage-6 checkpoint predates the current normalized "
+                        "PSD interpolation; rebuilding templates and eigenvalues"
                     )
                 require_replaceable(
                     (templates_path, template_metadata_path),
@@ -935,12 +1115,19 @@ def main() -> None:
                         detector.whitened_model.particle_psd
                     ),
                 )
-                save_npy(detector.templates, templates_path)
-                detector.templates = np.load(
-                    templates_path,
-                    mmap_mode="r",
-                    allow_pickle=False,
-                )
+                if args.skip_raw_template_checkpoint:
+                    LOGGER.info(
+                        "Raw template checkpoint omitted; retaining %.2f GiB "
+                        "in host RAM until block QR completes",
+                        detector.templates.nbytes / 2**30,
+                    )
+                else:
+                    save_npy(detector.templates, templates_path)
+                    detector.templates = np.load(
+                        templates_path,
+                        mmap_mode="r",
+                        allow_pickle=False,
+                    )
                 save_npz(
                     template_metadata_path,
                     template_eigenvalues=detector.model.eigvals,
@@ -948,6 +1135,10 @@ def main() -> None:
                     radial_eigenfunctions=detector.model.eigfuncs,
                     template_orders=detector.model.template_orders,
                     template_m_values=detector.model.template_m_values,
+                    template_multiplicities=(
+                        detector.model.template_multiplicities
+                    ),
+                    template_model_method=np.asarray(_TEMPLATE_MODEL_METHOD),
                     available_radial_mode_count=np.asarray(
                         detector.model.available_radial_mode_count
                     ),
@@ -993,6 +1184,22 @@ def main() -> None:
                 detector.model.template_m_values = metadata[
                     "template_m_values"
                 ].copy()
+                detector.model.template_multiplicities = (
+                    metadata["template_multiplicities"].copy()
+                    if "template_multiplicities" in metadata
+                    else (
+                        np.ones_like(
+                            detector.model.template_m_values,
+                            dtype=np.float32,
+                        )
+                        if np.any(detector.model.template_m_values < 0)
+                        else np.where(
+                            detector.model.template_m_values == 0,
+                            1,
+                            2,
+                        ).astype(np.float32)
+                    )
+                )
                 for name in (
                     "available_radial_mode_count",
                     "available_template_count",
@@ -1002,7 +1209,11 @@ def main() -> None:
                 ):
                     if name in metadata:
                         setattr(detector.model, name, metadata[name].item())
-            if detector.model.eigvals.shape != (detector.templates.shape[0],):
+            if (
+                detector.templates is not None
+                and detector.model.eigvals.shape
+                != (detector.templates.shape[0],)
+            ):
                 raise RuntimeError(
                     "template checkpoint metadata does not match the template "
                     "array; rerun stage 6 with --overwrite"
@@ -1014,7 +1225,7 @@ def main() -> None:
                 )
             if (
                 detector.model.max_templates is not None
-                and detector.templates.shape[0] > detector.model.max_templates
+                and detector.model.eigvals.shape[0] > detector.model.max_templates
             ):
                 raise RuntimeError(
                     "template checkpoint exceeds the current --max-templates; "
@@ -1054,12 +1265,19 @@ def main() -> None:
                         "template checkpoint uses a different template cap; "
                         "rerun stage 6 with --overwrite"
                     )
-            log_array("KLT templates", detector.templates)
+            if detector.templates is not None:
+                log_array("KLT templates", detector.templates)
+                template_spatial_shape = detector.templates.shape[1:]
+            else:
+                template_spatial_shape = (detector.model.template_side,) * 3
+                LOGGER.info("KLT raw templates: omitted after completed block QR")
             log_array("Template eigenvalues", detector.model.eigvals)
             LOGGER.info(
-                "Templates: complete modes=%d | radial modes=%s | "
-                "available complete=%s | retained energy=%s | spatial shape=%s",
-                detector.templates.shape[0],
+                "Templates: stored m>=0 representatives=%d | effective complete "
+                "modes=%s | radial modes=%s | available complete=%s | "
+                "retained energy=%s | spatial shape=%s",
+                detector.model.eigvals.shape[0],
+                detector.model.retained_template_count,
                 detector.model.retained_radial_mode_count,
                 detector.model.available_template_count,
                 (
@@ -1067,18 +1285,9 @@ def main() -> None:
                     if detector.model.retained_template_energy_fraction is None
                     else f"{detector.model.retained_template_energy_fraction:.6f}"
                 ),
-                detector.templates.shape[1:],
+                template_spatial_shape,
             )
 
-            score_templates_path = args.results_dir / "06b_block_qr_templates.npy"
-            score_model_path = args.results_dir / "06b_block_qr_score_model.npz"
-            score_checkpoint_compatible = False
-            if score_model_path.is_file():
-                with np.load(score_model_path, allow_pickle=False) as score_model:
-                    score_checkpoint_compatible = (
-                        "method" in score_model
-                        and score_model["method"].item() == _SCORE_MODEL_METHOD
-                    )
             score_model_recomputed = False
             if (
                 args.resume
@@ -1116,7 +1325,19 @@ def main() -> None:
                     detector.adjusted_template_eigenvalues = score_model[
                         "adjusted_template_eigenvalues"
                     ].copy()
+                    detector.score_multiplicities = score_model[
+                        "score_multiplicities"
+                    ].copy()
+                    detector.score_template_indices = score_model[
+                        "score_template_indices"
+                    ].copy()
             else:
+                if detector.templates is None:
+                    raise RuntimeError(
+                        "raw templates are unavailable and the block-QR "
+                        "checkpoint is incomplete; rerun stage 6 with "
+                        "--overwrite"
+                    )
                 if (
                     args.resume
                     and score_model_path.is_file()
@@ -1124,12 +1345,12 @@ def main() -> None:
                 ):
                     if not args.overwrite:
                         raise RuntimeError(
-                            "stage-6b checkpoint uses the legacy likelihood "
-                            "scale; pass --resume --overwrite to rebuild stage "
+                            "stage-6b checkpoint uses an incompatible likelihood "
+                            "model; pass --resume --overwrite to rebuild stage "
                             "6b onward"
                         )
                     LOGGER.warning(
-                        "Stage-6b checkpoint uses the legacy likelihood scale; "
+                        "Stage-6b checkpoint uses an incompatible likelihood model; "
                         "rebuilding block-QR score parameters"
                     )
                 require_replaceable(
@@ -1155,15 +1376,168 @@ def main() -> None:
                     adjusted_template_eigenvalues=(
                         detector.adjusted_template_eigenvalues
                     ),
+                    score_multiplicities=detector.score_multiplicities,
+                    score_template_indices=detector.score_template_indices,
                     noise_variance=np.asarray(
                         detector.whitened_model.noise_variance
                     ),
                 )
+
+            if args.score_noise_model == "radial-colored":
+                base_signal_eigenvalues = np.asarray(
+                    detector.adjusted_template_eigenvalues,
+                    dtype=np.float64,
+                ).copy()
+                colored_templates_path = (
+                    args.results_dir / "06c_radial_colored_score_templates.npy"
+                )
+                colored_model_path = (
+                    args.results_dir / "06c_radial_colored_score_model.npz"
+                )
+                empirical_noise_psd, empirical_noise_variance = (
+                    estimate_low_variance_noise_rpsd(detector.whitened_rpsds)
+                )
+                LOGGER.info(
+                    "Experimental radial-colored likelihood | quiet-patch "
+                    "variance=%.8g | PSD floor fraction=%.6g",
+                    empirical_noise_variance,
+                    args.colored_noise_floor_fraction,
+                )
+                log_array("Empirical residual noise PSD", empirical_noise_psd)
+                colored_compatible = False
+                if colored_model_path.is_file():
+                    with np.load(colored_model_path, allow_pickle=False) as model:
+                        colored_compatible = (
+                            "method" in model
+                            and model["method"].item() == _COLORED_SCORE_MODEL_METHOD
+                            and "noise_psd" in model
+                            and np.allclose(model["noise_psd"], empirical_noise_psd)
+                            and "floor_fraction" in model
+                            and np.isclose(
+                                model["floor_fraction"].item(),
+                                args.colored_noise_floor_fraction,
+                            )
+                            and "base_signal_eigenvalues" in model
+                            and np.allclose(
+                                model["base_signal_eigenvalues"],
+                                base_signal_eigenvalues,
+                            )
+                        )
+                if (
+                    args.resume
+                    and colored_templates_path.is_file()
+                    and colored_model_path.is_file()
+                    and colored_compatible
+                ):
+                    LOGGER.info(
+                        "STAGE RESUME | radial-colored score model | loading %s",
+                        colored_model_path,
+                    )
+                    detector.score_templates = np.load(
+                        colored_templates_path, mmap_mode="r", allow_pickle=False
+                    )
+                    with np.load(colored_model_path, allow_pickle=False) as model:
+                        detector.template_normalization = model[
+                            "template_normalization"
+                        ].copy()
+                        detector.score_weights = model["score_weights"].copy()
+                        detector.score_offset = np.float32(model["score_offset"])
+                        detector.adjusted_template_eigenvalues = model[
+                            "adjusted_template_eigenvalues"
+                        ].copy()
+                    score_model_recomputed = False
+                else:
+                    if (
+                        args.resume
+                        and colored_model_path.is_file()
+                        and not colored_compatible
+                    ):
+                        if not args.overwrite:
+                            raise RuntimeError(
+                                "radial-colored score checkpoint is incompatible; "
+                                "pass --resume --overwrite to rebuild stage 6c onward"
+                            )
+                    require_replaceable(
+                        (colored_templates_path, colored_model_path),
+                        overwrite=args.overwrite,
+                    )
+                    base_templates = detector.score_templates
+                    score_model_recomputed = True
+                    run_stage(
+                        "6c/8 experimental radial-colored likelihood model",
+                        lambda: prepare_radial_colored_score_checkpoint(
+                            detector,
+                            base_templates,
+                            detector.whitened_rpsds.radial_points,
+                            empirical_noise_psd,
+                            args.colored_noise_floor_fraction,
+                            colored_templates_path,
+                        ),
+                    )
+                    save_npz(
+                        colored_model_path,
+                        method=np.asarray(_COLORED_SCORE_MODEL_METHOD),
+                        template_normalization=detector.template_normalization,
+                        score_weights=detector.score_weights,
+                        score_offset=np.asarray(detector.score_offset),
+                        adjusted_template_eigenvalues=(
+                            detector.adjusted_template_eigenvalues
+                        ),
+                        base_signal_eigenvalues=base_signal_eigenvalues,
+                        noise_psd=empirical_noise_psd,
+                        noise_variance=np.asarray(empirical_noise_variance),
+                        floor_fraction=np.asarray(
+                            args.colored_noise_floor_fraction
+                        ),
+                    )
+                score_templates_path = colored_templates_path
+            if args.skip_raw_template_checkpoint and detector.templates is not None:
+                detector.templates = None
+                LOGGER.info("Released raw pre-QR template bank from host RAM")
             log_array("KLT score weights", detector.score_weights)
             LOGGER.info("Block-QR score templates: %s", score_templates_path)
+            active_score_mask = (
+                np.isfinite(detector.template_normalization)
+                & np.isfinite(detector.score_weights)
+                & np.isfinite(detector.adjusted_template_eigenvalues)
+                & (detector.score_weights > 0)
+            )
+            active_nominal_energy = np.sum(
+                detector.model.eigvals[detector.score_template_indices][
+                    active_score_mask
+                ]
+                * detector.score_multiplicities[active_score_mask]
+            )
+            retained_nominal_energy = np.sum(
+                detector.model.eigvals[detector.score_template_indices]
+                * detector.score_multiplicities
+            )
+            active_trace_fraction = (
+                None
+                if detector.model.retained_template_energy_fraction is None
+                else detector.model.retained_template_energy_fraction
+                * active_nominal_energy
+                / retained_nominal_energy
+            )
+            LOGGER.info(
+                "Conjugate symmetry: checkpoint representatives=%d | "
+                "active representatives=%d | dropped=%d | active effective "
+                "modes=%d | active trace=%s",
+                active_score_mask.size,
+                int(np.count_nonzero(active_score_mask)),
+                int(np.count_nonzero(~active_score_mask)),
+                int(np.sum(detector.score_multiplicities[active_score_mask])),
+                (
+                    "unknown"
+                    if active_trace_fraction is None
+                    else f"{active_trace_fraction:.6f}"
+                ),
+            )
             LOGGER.info("KLT likelihood offset: %.8g", detector.score_offset)
 
             candidate_tag = f"top{args.candidate_capacity_per_subvolume}"
+            if args.score_noise_model == "radial-colored":
+                candidate_tag = f"radialcolored_{candidate_tag}"
             candidates_path = args.results_dir / f"07_candidates_{candidate_tag}.npy"
             score_plan_path = args.results_dir / f"07_score_plan_{candidate_tag}.json"
             candidates_recomputed = False
@@ -1233,7 +1607,8 @@ def main() -> None:
             particles_xyz_score = detector.particles[:, [2, 1, 0, 3]]
             save_csv(
                 particles_xyz_score,
-                args.results_dir / "08_particles_xyz.csv",
+                args.results_dir
+                / f"08_particles_xyz{score_artifact_suffix}.csv",
                 header="x,y,z,normalized_score",
             )
             LOGGER.info(
@@ -1242,20 +1617,88 @@ def main() -> None:
                 truth_count,
             )
 
-        evaluation, matches = evaluate_recall(
+            positive_candidates = detector.candidates[
+                np.isfinite(detector.candidates[:, 3])
+                & (detector.candidates[:, 3] > 0)
+            ]
+            positive_particles_path = (
+                args.results_dir
+                / f"08_positive_particles_{candidate_tag}_zyx.npy"
+            )
+            if (
+                args.resume
+                and not candidates_recomputed
+                and positive_particles_path.is_file()
+            ):
+                LOGGER.info(
+                    "STAGE RESUME | positive-score global NMS | loading %s",
+                    positive_particles_path,
+                )
+                positive_particles = np.load(
+                    positive_particles_path,
+                    allow_pickle=False,
+                )
+            else:
+                require_replaceable(
+                    (positive_particles_path,),
+                    overwrite=args.overwrite,
+                )
+                positive_particles, elapsed = run_stage(
+                    "8b/8 global NMS over every positive-score candidate",
+                    lambda: ranked_candidate_nms_3d(
+                        positive_candidates,
+                        radius=detector.model.nms_radius_voxels,
+                        max_picks=len(positive_candidates),
+                    ),
+                )
+                save_npy(positive_particles, positive_particles_path)
+                record_stage_time(stage_times, "positive_score_global_nms", elapsed)
+            save_csv(
+                positive_particles[:, [2, 1, 0, 3]],
+                args.results_dir
+                / f"08_positive_particles_xyz{score_artifact_suffix}.csv",
+                header="x,y,z,raw_score",
+            )
+            LOGGER.info(
+                "Positive-score selection: raw candidates=%d | after NMS=%d",
+                len(positive_candidates),
+                len(positive_particles),
+            )
+
+        top_n_evaluation, top_n_matches = evaluate_recall(
             detector.particles,
             truth_zyx,
             match_radius_voxels,
         )
+        evaluation, matches = evaluate_recall(
+            positive_particles,
+            truth_zyx,
+            match_radius_voxels,
+        )
+        evaluation["selection"] = "all_positive_scores_after_global_nms"
+        evaluation["raw_positive_candidate_count"] = len(positive_candidates)
+        evaluation["requested_pick_count"] = None
+        evaluation["top_n_reference"] = top_n_evaluation
         evaluation["match_radius_angstrom"] = float(match_radius_angstrom)
         evaluation["total_runtime_minutes"] = (
             time.perf_counter() - started
         ) / 60
         evaluation["stage_runtime_seconds"] = stage_times
-        save_json(evaluation, args.results_dir / "09_evaluation.json")
+        save_json(
+            evaluation,
+            args.results_dir / f"09_evaluation{score_artifact_suffix}.json",
+        )
         save_csv(
             matches,
-            args.results_dir / "09_matches.csv",
+            args.results_dir / f"09_matches{score_artifact_suffix}.csv",
+            header=(
+                "prediction_index,truth_index,pred_z,pred_y,pred_x,"
+                "truth_z,truth_y,truth_x,distance_voxels"
+            ),
+        )
+        save_csv(
+            top_n_matches,
+            args.results_dir / f"09_top_n_matches{score_artifact_suffix}.csv",
             header=(
                 "prediction_index,truth_index,pred_z,pred_y,pred_x,"
                 "truth_z,truth_y,truth_x,distance_voxels"
@@ -1264,22 +1707,35 @@ def main() -> None:
         save_pickle(
             {
                 "particles_zyx_score": detector.particles,
+                "positive_particles_zyx_score": positive_particles,
                 "ground_truth_zyx": truth_zyx,
                 "matches": matches,
+                "top_n_matches": top_n_matches,
                 "evaluation": evaluation,
             },
-            args.results_dir / "09_final_result.pkl",
+            args.results_dir / f"09_final_result{score_artifact_suffix}.pkl",
         )
         LOGGER.info("=" * 72)
         LOGGER.info(
-            "FINAL RECALL | matched=%d / truth=%d | recall=%.4f",
+            "FINAL POSITIVE-SCORE METRICS | picks=%d | matched=%d / truth=%d | "
+            "recall=%.4f | precision=%.4f",
+            evaluation["returned_pick_count"],
             evaluation["matched_ground_truth_count"],
             evaluation["ground_truth_count"],
             evaluation["recall"],
+            evaluation["precision"] or 0.0,
+        )
+        LOGGER.info(
+            "TOP-%d REFERENCE RECALL | matched=%d / truth=%d | recall=%.4f",
+            truth_count,
+            top_n_evaluation["matched_ground_truth_count"],
+            top_n_evaluation["ground_truth_count"],
+            top_n_evaluation["recall"],
         )
         LOGGER.info(
             "Coordinates: %s",
-            args.results_dir / "08_particles_xyz.csv",
+            args.results_dir
+            / f"08_particles_xyz{score_artifact_suffix}.csv",
         )
         LOGGER.info(
             "Experiment completed in %.2f minutes | results=%s",

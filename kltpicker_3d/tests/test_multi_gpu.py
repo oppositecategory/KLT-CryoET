@@ -5,6 +5,7 @@ from numpy.testing import assert_allclose, assert_array_equal
 from scipy import ndimage
 from scipy.signal import fftconvolve
 
+import kltpicker_3d.multi_gpu as multi_gpu_module
 from kltpicker_3d.multi_gpu import (
     MultiGPUKLTParticleDetector3D,
     compute_fused_klt_score_shard,
@@ -12,11 +13,17 @@ from kltpicker_3d.multi_gpu import (
     construct_klt_score_filters,
     distributed_block_qr_score_parameters,
     extract_score_candidates,
+    estimate_low_variance_noise_rpsd,
+    next_cufft_fast_length,
     orthogonal_klt_score_parameters,
+    plan_cufft_fft_shape,
     plan_template_fft_batch,
+    radial_colored_block_qr_score_parameters,
+    radial_noise_inverse_sqrt_multiplier,
     ranked_candidate_nms_3d,
+    validate_active_score_templates,
 )
-from kltpicker_3d.streaming import ArrayVolumeSource
+from kltpicker_3d.streaming import ArrayVolumeSource, RpsdExtractionResult
 from kltpicker_3d.utils import construct_finite_bandpass_filter
 
 
@@ -35,6 +42,77 @@ def test_finite_bandpass_rejects_constant_and_has_bounded_support():
     assert_array_equal(kernel[outside], 0)
 
 
+def test_low_variance_noise_rpsd_uses_quiet_patch_population():
+    extraction = RpsdExtractionResult(
+        rpsds=np.array([[1, 1, 1], [2, 2, 2], [20, 20, 20], [30, 30, 30]]),
+        variances=np.array([1, 2, 20, 30]),
+        radial_points=np.array([0, np.pi / 2, np.pi]),
+        patch_grid_shape=(1, 1, 4),
+        patch_size=3,
+    )
+    noise_psd, variance = estimate_low_variance_noise_rpsd(
+        extraction, fraction=0.5
+    )
+    assert_allclose(variance, 1.5)
+    from kltpicker_3d.utils import radial_psd_to_variance
+    assert_allclose(
+        radial_psd_to_variance(extraction.radial_points, noise_psd),
+        variance,
+    )
+
+
+def test_radial_colored_score_matches_dense_gaussian_quadratic():
+    rng = np.random.default_rng(81)
+    shape = (3, 3, 3)
+    templates = (
+        rng.standard_normal((2, *shape))
+        + 1j * rng.standard_normal((2, *shape))
+    ).astype(np.complex64)
+    eigenvalues = np.array([1.2, 0.4])
+    points = np.array([0.0, np.pi / 2, np.pi])
+    noise_psd = np.array([0.5, 1.0, 2.0])
+    filters, weights, offset, _ = radial_colored_block_qr_score_parameters(
+        templates,
+        eigenvalues,
+        np.zeros(2, dtype=np.int64),
+        np.zeros(2, dtype=np.int64),
+        points,
+        noise_psd,
+        floor_fraction=1e-6,
+    )
+    multiplier = radial_noise_inverse_sqrt_multiplier(
+        points, noise_psd, shape, floor_fraction=1e-6
+    )
+    voxel_count = int(np.prod(shape))
+    # Materialize W by applying it to voxel basis vectors.
+    identity = np.eye(voxel_count).reshape(voxel_count, *shape)
+    from kltpicker_3d.multi_gpu import _apply_fourier_multiplier
+    whitening = _apply_fourier_multiplier(identity, multiplier).reshape(
+        voxel_count, voxel_count
+    ).T
+    inverse_whitening = np.linalg.inv(whitening)
+    noise_covariance = inverse_whitening @ inverse_whitening.conj().T
+    template_matrix = templates.reshape(2, voxel_count).T
+    signal_covariance = (
+        template_matrix * eigenvalues[None, :]
+    ) @ template_matrix.conj().T
+    sample = rng.standard_normal(voxel_count)
+    inverse_difference = np.linalg.inv(noise_covariance) - np.linalg.inv(
+        noise_covariance + signal_covariance
+    )
+    determinant_difference = (
+        np.linalg.slogdet(noise_covariance + signal_covariance)[1]
+        - np.linalg.slogdet(noise_covariance)[1]
+    )
+    dense = (
+        np.real(sample.conj() @ inverse_difference @ sample)
+        - determinant_difference
+    )
+    responses = filters.reshape(2, voxel_count).conj() @ sample
+    compact = np.sum(weights * np.abs(responses) ** 2) - offset
+    assert_allclose(compact, dense, rtol=2e-4, atol=2e-4)
+
+
 def test_candidate_top_k_reports_full_count_and_retains_only_capacity():
     scores = np.zeros((7, 7, 7), dtype=np.float32)
     scores[2, 2, 2] = 3
@@ -45,13 +123,32 @@ def test_candidate_top_k_reports_full_count_and_retains_only_capacity():
         jnp.full(3, 5, dtype=jnp.int32),
         core_shape=(5, 5, 5),
         source_shape=(20, 20, 20),
-        template_radius=0,
+        valid_radius=0,
         candidate_capacity=1,
     )
 
     assert int(count) == 2
     assert_array_equal(np.asarray(coordinates), np.array([[1, 1, 1]]))
     assert_allclose(np.asarray(values), np.array([3], dtype=np.float32))
+
+
+def test_candidate_extraction_rejects_incomplete_composed_support():
+    scores = np.zeros((7, 7, 7), dtype=np.float32)
+    scores[2, 2, 2] = 3
+    scores[4, 4, 4] = 2
+
+    coordinates, values, count = extract_score_candidates(
+        jnp.asarray(scores),
+        jnp.zeros(3, dtype=jnp.int32),
+        core_shape=(5, 5, 5),
+        source_shape=(20, 20, 20),
+        valid_radius=3,
+        candidate_capacity=2,
+    )
+
+    assert int(count) == 1
+    assert_array_equal(np.asarray(coordinates[0]), np.array([3, 3, 3]))
+    assert_allclose(np.asarray(values[0]), 2)
 
 
 def test_distributed_block_qr_preserves_each_signal_covariance():
@@ -100,6 +197,142 @@ def test_distributed_block_qr_preserves_each_signal_covariance():
     )
 
 
+def test_distributed_block_qr_falls_back_after_gpu_runtime_error(monkeypatch):
+    rng = np.random.default_rng(456)
+    templates = (
+        rng.standard_normal((4, 3, 3, 3))
+        + 1j * rng.standard_normal((4, 3, 3, 3))
+    ).astype(np.complex64)
+    eigenvalues = np.array([4.0, 1.5, 3.0, 0.5], dtype=np.float32)
+    orders = np.array([0, 0, 1, 1])
+    m_values = np.zeros(4, dtype=np.int64)
+    arguments = (
+        templates,
+        eigenvalues,
+        orders,
+        m_values,
+        0.8,
+    )
+    expected = distributed_block_qr_score_parameters(
+        *arguments,
+        devices=(jax.devices()[0],),
+        host_qr=True,
+    )
+
+    def failing_jit(function):
+        del function
+
+        def fail_at_dispatch(*args, **kwargs):
+            del args, kwargs
+            raise RuntimeError("simulated unsupported GPU QR")
+
+        return fail_at_dispatch
+
+    monkeypatch.setattr(multi_gpu_module.jax, "jit", failing_jit)
+    actual = distributed_block_qr_score_parameters(
+        *arguments,
+        devices=(jax.devices()[0],),
+    )
+
+    for actual_array, expected_array in zip(actual, expected):
+        assert_allclose(actual_array, expected_array, rtol=2e-5, atol=2e-5)
+
+
+def test_nonnegative_m_scoring_matches_explicit_conjugate_pairs():
+    rng = np.random.default_rng(2026)
+    positive = (
+        rng.standard_normal((2, 3, 3, 3))
+        + 1j * rng.standard_normal((2, 3, 3, 3))
+    ).astype(np.complex64)
+    zero = rng.standard_normal((2, 3, 3, 3)).astype(np.complex64)
+    templates = np.empty((6, 3, 3, 3), dtype=np.complex64)
+    for radial_index in range(2):
+        start = 3 * radial_index
+        templates[start] = -np.conj(positive[radial_index])
+        templates[start + 1] = zero[radial_index]
+        templates[start + 2] = positive[radial_index]
+
+    eigenvalues = np.repeat(
+        np.array([3.0, 0.75], dtype=np.float32),
+        3,
+    )
+    orders = np.ones(6, dtype=np.int64)
+    m_values = np.tile(np.array([-1, 0, 1], dtype=np.int64), 2)
+    kernels, effective_weights, offset, transformed_eigenvalues = (
+        distributed_block_qr_score_parameters(
+            templates,
+            eigenvalues,
+            orders,
+            m_values,
+            noise_variance=0.8,
+            devices=(jax.devices()[0],),
+            host_qr=True,
+        )
+    )
+
+    assert kernels.shape == (4, 3, 3, 3)
+    representative_m = m_values[m_values >= 0]
+    assert_array_equal(representative_m, np.array([0, 1, 0, 1]))
+    multiplicities = np.where(representative_m == 0, 1, 2)
+    expected_base_weights = 1 / 0.8 - 1 / (
+        0.8 + transformed_eigenvalues
+    )
+    assert_allclose(
+        effective_weights,
+        multiplicities * expected_base_weights,
+        rtol=2e-5,
+    )
+    assert_allclose(
+        offset,
+        np.sum(
+            multiplicities
+            * np.log1p(transformed_eigenvalues / 0.8)
+        ),
+        rtol=2e-5,
+    )
+
+    zero_indices = np.flatnonzero(representative_m == 0)
+    positive_indices = np.flatnonzero(representative_m > 0)
+    expanded_kernels = np.concatenate(
+        (
+            kernels[zero_indices],
+            kernels[positive_indices],
+            np.conj(kernels[positive_indices]),
+        )
+    )
+    expanded_weights = np.concatenate(
+        (
+            effective_weights[zero_indices],
+            effective_weights[positive_indices] / 2,
+            effective_weights[positive_indices] / 2,
+        )
+    )
+    loaded = rng.standard_normal((5, 5, 5)).astype(np.float32)
+    whitening_filter = np.ones((1, 1, 1), dtype=np.float32)
+    compressed_score = compute_klt_score_block(
+        jnp.asarray(loaded),
+        jnp.asarray(whitening_filter),
+        jnp.asarray(kernels),
+        jnp.asarray(effective_weights),
+        jnp.asarray(offset),
+        core_shape=(3, 3, 3),
+        whitening_radius=0,
+        score_halo=0,
+    )
+    expanded_score = compute_klt_score_block(
+        jnp.asarray(loaded),
+        jnp.asarray(whitening_filter),
+        jnp.asarray(expanded_kernels),
+        jnp.asarray(expanded_weights),
+        jnp.asarray(offset),
+        core_shape=(3, 3, 3),
+        whitening_radius=0,
+        score_halo=0,
+    )
+
+    assert_allclose(compressed_score, expanded_score, rtol=2e-5, atol=2e-5)
+
+
 def test_fused_batched_fft_matches_sequential_convolution():
     rng = np.random.default_rng(44)
     core_shape = (5, 5, 5)
@@ -144,6 +377,61 @@ def test_fused_batched_fft_matches_sequential_convolution():
     assert_allclose(fused, sequential, rtol=1e-5, atol=2e-4)
 
 
+def test_cufft_fast_length_and_shape_planning():
+    assert next_cufft_fast_length(358) == 360
+    assert next_cufft_fast_length(360) == 360
+    assert plan_cufft_fft_shape((358, 359, 360)) == (360, 360, 360)
+    assert plan_cufft_fft_shape((358, 359, 360), (360, 364, 375)) == (
+        360,
+        364,
+        375,
+    )
+
+
+def test_fast_fft_padding_preserves_fused_valid_scores():
+    rng = np.random.default_rng(45)
+    loaded = rng.standard_normal((11, 11, 11)).astype(np.float32)
+    whitening_filter = rng.standard_normal((3, 3, 3)).astype(np.float32)
+    templates = (
+        rng.standard_normal((2, 3, 3, 3))
+        + 1j * rng.standard_normal((2, 3, 3, 3))
+    ).astype(np.complex64)
+    normalization, weights, offset, _ = orthogonal_klt_score_parameters(
+        templates,
+        np.array([2.0, 0.75]),
+        0.8,
+    )
+
+    arguments = (
+        jnp.asarray(loaded),
+        jnp.asarray(whitening_filter),
+        jnp.asarray(templates),
+        jnp.asarray(normalization),
+        jnp.asarray(weights),
+        jnp.asarray(offset),
+    )
+    options = dict(
+        core_shape=(5, 5, 5),
+        whitening_radius=1,
+        template_radius=1,
+        score_halo=1,
+        template_batch_size=2,
+        axis_name=None,
+    )
+    exact = compute_fused_klt_score_shard(
+        *arguments,
+        **options,
+        fft_shape=(11, 11, 11),
+    )
+    padded = compute_fused_klt_score_shard(
+        *arguments,
+        **options,
+        fft_shape=(12, 12, 12),
+    )
+
+    assert_allclose(padded, exact, rtol=2e-5, atol=2e-4)
+
+
 def test_fft_batch_planner_accounts_for_resident_template_shard():
     plan = plan_template_fft_batch(
         (32, 32, 32),
@@ -156,6 +444,29 @@ def test_fft_batch_planner_accounts_for_resident_template_shard():
 
     assert plan["batch_size"] >= 1
     assert plan["estimated_peak_bytes"] <= plan["budget_bytes"]
+
+
+def test_active_score_template_validation_ignores_dropped_nan_rows():
+    templates = np.ones((3, 3, 3, 3), dtype=np.complex64)
+    templates[1] = np.nan
+
+    validate_active_score_templates(
+        templates,
+        np.array([0, 2], dtype=np.int64),
+        rows_per_chunk=1,
+    )
+
+
+def test_active_score_template_validation_rejects_retained_nan_rows():
+    templates = np.ones((3, 3, 3, 3), dtype=np.complex64)
+    templates[1] = np.nan
+
+    with np.testing.assert_raises_regex(RuntimeError, "non-finite rows: \\[1\\]"):
+        validate_active_score_templates(
+            templates,
+            np.array([0, 1, 2], dtype=np.int64),
+            rows_per_chunk=1,
+        )
 
 
 def test_global_candidate_nms_is_independent_of_device_completion_order():
@@ -189,12 +500,53 @@ def test_global_candidate_nms_is_independent_of_device_completion_order():
     assert_array_equal(shuffled, expected)
 
 
+def test_spatial_hash_nms_matches_quadratic_reference():
+    rng = np.random.default_rng(18)
+    candidates = np.column_stack(
+        (
+            rng.integers(0, 40, size=(300, 3)),
+            rng.standard_normal(300),
+        )
+    ).astype(np.float64)
+
+    def quadratic(radius: float, max_picks: int) -> np.ndarray:
+        order = np.lexsort(
+            (
+                candidates[:, 2],
+                candidates[:, 1],
+                candidates[:, 0],
+                -candidates[:, 3],
+            )
+        )
+        accepted = []
+        for candidate in candidates[order]:
+            if accepted:
+                differences = np.asarray(accepted)[:, :3] - candidate[:3]
+                if np.any(np.sum(differences**2, axis=1) <= radius**2):
+                    continue
+            accepted.append(candidate)
+            if len(accepted) == max_picks:
+                break
+        return np.asarray(accepted)
+
+    for radius in (0, 1, 3.5, 8):
+        for max_picks in (1, 20, len(candidates)):
+            assert_array_equal(
+                ranked_candidate_nms_3d(
+                    candidates,
+                    radius=radius,
+                    max_picks=max_picks,
+                ),
+                quadratic(radius, max_picks),
+            )
+
+
 def test_streamed_candidates_match_complete_volume_scoring():
     rng = np.random.default_rng(91)
     volume = rng.standard_normal((13, 14, 15)).astype(np.float32)
     whitening_filter = np.ones((3, 3, 3), dtype=np.float32) / 27
-    templates = rng.standard_normal((2, 3, 3, 3)).astype(np.float32)
-    template_eigenvalues = np.array([2.0, 0.75], dtype=np.float32)
+    templates = rng.standard_normal((7, 3, 3, 3)).astype(np.float32)
+    template_eigenvalues = np.linspace(2.0, 0.5, 7, dtype=np.float32)
     noise_variance = 0.8
 
     detector = MultiGPUKLTParticleDetector3D(
@@ -211,10 +563,11 @@ def test_streamed_candidates_match_complete_volume_scoring():
         psd_patch_size=3,
         fredholm_radius=1,
         template_side=3,
+        score_template_chunk_size=1,
     )
     detector.model.eigvals = template_eigenvalues
-    detector.model.template_orders = np.zeros(2, dtype=np.int64)
-    detector.model.template_m_values = np.zeros(2, dtype=np.int64)
+    detector.model.template_orders = np.zeros(7, dtype=np.int64)
+    detector.model.template_m_values = np.zeros(7, dtype=np.int64)
     kernels, weights, offset, _ = detector.prepare_score_filters(
         templates,
         noise_variance,
@@ -238,6 +591,16 @@ def test_streamed_candidates_match_complete_volume_scoring():
         )
         complete_score += weight * np.square(np.abs(response))
     complete_score -= offset
+
+    complete_coordinates = (
+        np.indices(complete_score.shape).transpose(1, 2, 3, 0) + 1
+    )
+    valid = np.all(
+        (complete_coordinates >= 3)
+        & (complete_coordinates < np.asarray(volume.shape) - 3),
+        axis=-1,
+    )
+    complete_score = np.where(valid, complete_score, -np.inf)
 
     maximum = ndimage.maximum_filter(
         complete_score,
@@ -302,3 +665,9 @@ def test_complete_multi_gpu_detector_executes_on_streamed_volume():
     assert detector.initial_rpsds.rpsds.shape[0] == 4**3
     assert detector.whitened_rpsds.rpsds.shape == detector.initial_rpsds.rpsds.shape
     assert detector.templates.ndim == 4
+    assert np.all(detector.model.template_m_values >= 0)
+    assert detector.templates.shape[0] == detector.score_templates.shape[0]
+    assert_allclose(
+        np.sum(detector.model.template_multiplicities),
+        detector.model.retained_template_count,
+    )

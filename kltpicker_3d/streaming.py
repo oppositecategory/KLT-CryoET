@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
@@ -24,6 +26,7 @@ from kltpicker_3d.utils import (
 )
 
 PaddingMode = Literal["constant", "edge", "reflect", "wrap"]
+LOGGER = logging.getLogger(__name__)
 
 
 def default_psd_patch_size(
@@ -806,6 +809,23 @@ def extract_streamed_rpsds(
         progress_description = description
     static_kwargs["halo"] = halo
 
+    total_rounds = processor.round_count
+    total_subvolumes = processor.subvolume_count
+    total_patches = int(np.prod(patch_grid_shape))
+    progress_interval = max(1, total_rounds // 20)
+    started = time.monotonic()
+    completed_subvolumes = 0
+    completed_patches = 0
+    LOGGER.info(
+        "RPSD STREAM START | %s | rounds=%d | subvolumes=%d | patches=%d | "
+        "devices=%d | halo=%d",
+        progress_description,
+        total_rounds,
+        total_subvolumes,
+        total_patches,
+        len(processor.devices),
+        halo,
+    )
     outputs = processor.map(
         subvolume_function,
         *function_arguments,
@@ -813,7 +833,10 @@ def extract_streamed_rpsds(
         static_kwargs=static_kwargs,
         description=progress_description,
     )
-    for regions, (host_rpsds, host_variances) in outputs:
+    for round_index, (regions, (host_rpsds, host_variances)) in enumerate(
+        outputs,
+        start=1,
+    ):
         for slot, region in enumerate(regions):
             if region is None:
                 continue
@@ -838,6 +861,50 @@ def extract_streamed_rpsds(
             local_variances = host_variances[slot].reshape(core_patch_shape)
             rpsd_grid[destination] = local_rpsds[local]
             variance_grid[destination] = local_variances[local]
+            completed_subvolumes += 1
+            completed_patches += int(np.prod(valid))
+
+        elapsed = time.monotonic() - started
+        if round_index == 1:
+            LOGGER.info(
+                "RPSD STREAM WARMUP | %s | first round completed in %.2f s "
+                "(includes JAX compilation and first execution)",
+                progress_description,
+                elapsed,
+            )
+        if (
+            round_index == 1
+            or round_index % progress_interval == 0
+            or round_index == total_rounds
+        ):
+            patch_rate = completed_patches / max(elapsed, np.finfo(float).tiny)
+            remaining_patches = total_patches - completed_patches
+            eta = remaining_patches / patch_rate if patch_rate > 0 else float("inf")
+            LOGGER.info(
+                "RPSD STREAM PROGRESS | %s | rounds=%d/%d | "
+                "subvolumes=%d/%d | patches=%d/%d | elapsed=%.2f min | "
+                "rate=%.1f patches/s | ETA=%.2f min",
+                progress_description,
+                round_index,
+                total_rounds,
+                completed_subvolumes,
+                total_subvolumes,
+                completed_patches,
+                total_patches,
+                elapsed / 60,
+                patch_rate,
+                eta / 60,
+            )
+
+    LOGGER.info(
+        "RPSD STREAM DONE | %s | rounds=%d | subvolumes=%d | patches=%d | "
+        "elapsed=%.2f min",
+        progress_description,
+        total_rounds,
+        completed_subvolumes,
+        completed_patches,
+        (time.monotonic() - started) / 60,
+    )
 
     return RpsdExtractionResult(
         rpsds=rpsd_grid.reshape(-1, radial_points.size),

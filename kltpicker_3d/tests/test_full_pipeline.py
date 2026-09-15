@@ -4,6 +4,44 @@ import numpy as np
 from numpy.testing import assert_allclose
 
 from kltpicker_3d.tomogram import KLTParticleDetector3D
+from kltpicker_3d.utils import expand_spherical_harmonic_templates
+
+
+def test_nonnegative_spherical_harmonics_match_full_expansion():
+    grid = np.arange(-1, 2)
+    z, y, x = np.meshgrid(grid, grid, grid, indexing="ij")
+    radial_templates = np.stack(
+        (
+            np.ones_like(x, dtype=np.float32),
+            np.full_like(x, 2, dtype=np.float32),
+        )
+    )
+    orders = np.asarray([1, 2])
+
+    full, full_radial_indices, full_m_values = (
+        expand_spherical_harmonic_templates(
+            radial_templates,
+            orders,
+            x,
+            y,
+            z,
+        )
+    )
+    nonnegative, radial_indices, m_values = (
+        expand_spherical_harmonic_templates(
+            radial_templates,
+            orders,
+            x,
+            y,
+            z,
+            nonnegative_m_only=True,
+        )
+    )
+
+    keep = full_m_values >= 0
+    assert_allclose(nonnegative, full[keep])
+    assert np.array_equal(radial_indices, full_radial_indices[keep])
+    assert np.array_equal(m_values, full_m_values[keep])
 
 
 def test_complete_detector_executes_with_cpu_jax():

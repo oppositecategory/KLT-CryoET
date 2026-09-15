@@ -654,22 +654,85 @@ def prewhiten_tomogram(
     )
 
 
+def evaluate_spherical_harmonics(
+    orders: npt.ArrayLike,
+    m_values: npt.ArrayLike,
+    x: npt.ArrayLike,
+    y: npt.ArrayLike,
+    z: npt.ArrayLike,
+) -> npt.NDArray[np.complex128]:
+    """Evaluate specified spherical harmonics on a Cartesian coordinate grid."""
+    orders = np.asarray(orders, dtype=np.int64)
+    m_values = np.asarray(m_values, dtype=np.int64)
+    x = np.asarray(x)
+    y = np.asarray(y)
+    z = np.asarray(z)
+
+    if orders.ndim != 1 or m_values.shape != orders.shape:
+        raise ValueError("orders and m_values must be equal-length vectors")
+    if np.any(orders < 0) or np.any(np.abs(m_values) > orders):
+        raise ValueError("m values must satisfy abs(m) <= order")
+    if y.shape != x.shape or z.shape != x.shape:
+        raise ValueError("coordinate grids must have equal shapes")
+
+    azimuth = np.arctan2(y, x)
+    colatitude = np.arctan2(np.hypot(x, y), z)
+    angle_axes = (slice(None),) + (None,) * colatitude.ndim
+    modern_spherical_harmonic = getattr(
+        special,
+        "sph_harm_y",
+        None,
+    )
+    if modern_spherical_harmonic is not None:
+        return np.asarray(
+            modern_spherical_harmonic(
+                orders[angle_axes],
+                m_values[angle_axes],
+                colatitude[None, ...],
+                azimuth[None, ...],
+            ),
+            dtype=np.complex128,
+        )
+
+    # SciPy < 1.15 used the reversed argument and angle order.
+    legacy_spherical_harmonic = getattr(
+        special,
+        "sph_harm",
+        None,
+    )
+    if legacy_spherical_harmonic is None:
+        raise RuntimeError("SciPy provides neither sph_harm_y nor sph_harm")
+    return np.asarray(
+        legacy_spherical_harmonic(
+            m_values[angle_axes],
+            orders[angle_axes],
+            azimuth[None, ...],
+            colatitude[None, ...],
+        ),
+        dtype=np.complex128,
+    )
+
+
 def expand_spherical_harmonic_templates(
     radial_templates: npt.ArrayLike,
     orders: npt.ArrayLike,
     x: npt.ArrayLike,
     y: npt.ArrayLike,
     z: npt.ArrayLike,
+    *,
+    nonnegative_m_only: bool = False,
 ) -> tuple[
     npt.NDArray[np.generic],
     npt.NDArray[np.int64],
     npt.NDArray[np.int64],
 ]:
-    """Expand radial eigenfunctions into complete spherical-harmonic multiplets.
+    """Expand radial eigenfunctions into spherical-harmonic multiplets.
 
     For every radial eigenfunction of angular order ``ell``, this creates all
-    ``2*ell + 1`` complex modes with ``m=-ell,...,ell``. SciPy's modern
-    ``sph_harm_y`` interface expects polar colatitude followed by azimuth.
+    ``2*ell + 1`` complex modes with ``m=-ell,...,ell`` by default. When
+    ``nonnegative_m_only`` is true, it directly evaluates only
+    ``m=0,...,ell``. SciPy's modern ``sph_harm_y`` interface expects polar
+    colatitude followed by azimuth.
     """
     radial_templates = np.asarray(radial_templates)
     orders = np.asarray(orders, dtype=np.int64)
@@ -690,46 +753,25 @@ def expand_spherical_harmonic_templates(
     ):
         raise ValueError("coordinate grids must match the template grid")
 
-    azimuth = np.arctan2(y, x)
-    colatitude = np.arctan2(np.hypot(x, y), z)
-
-    multiplicities = 2 * orders + 1
+    multiplicities = orders + 1 if nonnegative_m_only else 2 * orders + 1
     radial_indices = np.repeat(
         np.arange(orders.size, dtype=np.int64),
         multiplicities,
     )
     mode_orders = orders[radial_indices]
     m_values = np.concatenate(
-        [np.arange(-ell, ell + 1, dtype=np.int64) for ell in orders]
+        [
+            np.arange(0 if nonnegative_m_only else -ell, ell + 1, dtype=np.int64)
+            for ell in orders
+        ]
     )
-    angle_axes = (slice(None),) + (None,) * colatitude.ndim
-    modern_spherical_harmonic = getattr(
-        special,
-        "sph_harm_y",
-        None,
+    angular_modes = evaluate_spherical_harmonics(
+        mode_orders,
+        m_values,
+        x,
+        y,
+        z,
     )
-    if modern_spherical_harmonic is not None:
-        angular_modes = modern_spherical_harmonic(
-            mode_orders[angle_axes],
-            m_values[angle_axes],
-            colatitude[None, ...],
-            azimuth[None, ...],
-        )
-    else:
-        # SciPy < 1.15 used the reversed argument and angle order.
-        legacy_spherical_harmonic = getattr(
-            special,
-            "sph_harm",
-            None,
-        )
-        if legacy_spherical_harmonic is None:
-            raise RuntimeError("SciPy provides neither sph_harm_y nor sph_harm")
-        angular_modes = legacy_spherical_harmonic(
-            m_values[angle_axes],
-            mode_orders[angle_axes],
-            azimuth[None, ...],
-            colatitude[None, ...],
-        )
     templates = radial_templates[radial_indices] * angular_modes
 
     return (

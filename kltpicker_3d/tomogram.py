@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import numpy.typing as npt
 from scipy.special import roots_legendre, spherical_jn
+from tqdm import tqdm
 
 from kltpicker_3d.alt_least_squares import (
     alternating_least_squares_solver,
@@ -21,13 +22,12 @@ from kltpicker_3d.spectral_estimation import (
 from kltpicker_3d.utils import (
     bandpass_filter_3d,
     calibrate_radial_psds,
-    expand_spherical_harmonic_templates,
+    evaluate_spherical_harmonics,
     generate_uniform_radial_sampling_points,
     prewhiten_tomogram,
     radial_average_jax,
     radial_mode_truncation_index,
     ranked_local_maxima_nms_3d,
-    trigonometric_interpolation,
 )
 
 _ALS_CONVERGENCE_TOLERANCE = 1e-4
@@ -49,6 +49,59 @@ def _odd_floor(value: float) -> int:
     """Return the largest odd integer not greater than ``value``."""
     size = int(np.floor(value))
     return size if size % 2 else size - 1
+
+
+def _interpolate_particle_psd_for_fredholm(
+    radial_points: npt.ArrayLike,
+    particle_psd: npt.ArrayLike,
+    quadrature_nodes: npt.ArrayLike,
+    quadrature_weights: npt.ArrayLike,
+) -> npt.NDArray[np.float64]:
+    """Interpolate a nonnegative PSD without changing its radial mass.
+
+    A PSD sampled on ``[0, pi]`` is not periodic. Trigonometric interpolation
+    therefore rings at its cutoffs; clipping the negative lobes then changes
+    the covariance trace. Linear interpolation is shape preserving, and the
+    final scalar correction makes its ``rho**2``-weighted Gauss--Legendre mass
+    exactly match the calibrated sampled PSD.
+    """
+    points = np.asarray(radial_points, dtype=np.float64)
+    spectrum = np.asarray(particle_psd, dtype=np.float64)
+    nodes = np.asarray(quadrature_nodes, dtype=np.float64)
+    weights = np.asarray(quadrature_weights, dtype=np.float64)
+    if points.ndim != 1 or spectrum.shape != points.shape:
+        raise ValueError("radial PSD samples must be equal-length vectors")
+    if nodes.ndim != 1 or weights.shape != nodes.shape:
+        raise ValueError(
+            "quadrature nodes and weights must be equal-length vectors"
+        )
+    if np.any(np.diff(points) <= 0) or np.any(spectrum < 0):
+        raise ValueError("radial PSD samples must be ordered and nonnegative")
+    if nodes.size < 1 or nodes[0] < points[0] or nodes[-1] > points[-1]:
+        raise ValueError(
+            "quadrature nodes must lie inside the sampled PSD interval"
+        )
+
+    interpolated = np.interp(nodes, points, spectrum)
+    source_integrand = spectrum * points**2
+    source_mass = np.sum(
+        0.5
+        * (source_integrand[:-1] + source_integrand[1:])
+        * np.diff(points)
+    )
+    # roots_legendre weights integrate on [-1, 1]; nodes were mapped to the
+    # sampled interval, so include that mapping's Jacobian here.
+    interval_jacobian = (points[-1] - points[0]) / 2
+    interpolated_mass = interval_jacobian * np.sum(
+        weights * interpolated * nodes**2
+    )
+    scale = max(1.0, abs(source_mass), abs(interpolated_mass))
+    tolerance = np.finfo(np.float64).eps * scale
+    if source_mass <= tolerance:
+        return np.zeros_like(interpolated)
+    if interpolated_mass <= tolerance:
+        raise ValueError("interpolated particle PSD has zero radial mass")
+    return interpolated * (source_mass / interpolated_mass)
 
 
 def _extract_nonoverlapping_patches(
@@ -269,6 +322,7 @@ class KLTParticleDetector3D:
         self.radial_eigvals: npt.NDArray[np.float64] | None = None
         self.template_orders: npt.NDArray[np.int64] | None = None
         self.template_m_values: npt.NDArray[np.int64] | None = None
+        self.template_multiplicities: npt.NDArray[np.float32] | None = None
         self.templates: npt.NDArray[np.generic] | None = None
 
     def process_tomogram(
@@ -338,22 +392,22 @@ class KLTParticleDetector3D:
         npt.NDArray[np.float64],
     ]:
         """Interpolate the particle PSD and solve every angular order."""
-        legendre_nodes, _ = roots_legendre(self.legendre_order)
+        legendre_nodes, legendre_weights = roots_legendre(self.legendre_order)
         frequency_nodes = (self.bandlimit / 2) * (legendre_nodes + 1)
-        particle_psd_nodes = np.maximum(
-            np.asarray(
-                trigonometric_interpolation(
-                    self.uniform_points,
-                    particle_psd,
-                    frequency_nodes,
-                )
-            ),
-            0,
+        particle_psd_nodes = _interpolate_particle_psd_for_fredholm(
+            self.uniform_points,
+            particle_psd,
+            frequency_nodes,
+            legendre_weights,
         )
 
         eigenvalue_blocks = []
         eigenfunction_blocks = []
-        for angular_order in range(self.max_order):
+        for angular_order in tqdm(
+            range(self.max_order),
+            desc="Fredholm angular sweep",
+            unit="ell",
+        ):
             eigenvalues, eigenfunctions, _ = solve_radial_fredholm_equation(
                 particle_psd_nodes,
                 angular_order,
@@ -474,6 +528,8 @@ class KLTParticleDetector3D:
         eigenfunctions: npt.ArrayLike,
         angular_orders: npt.ArrayLike,
         particle_psd_nodes: npt.ArrayLike,
+        *,
+        nonnegative_m_only: bool = False,
     ) -> tuple[
         npt.NDArray[np.generic],
         npt.NDArray[np.generic],
@@ -488,8 +544,10 @@ class KLTParticleDetector3D:
             particle_psd_nodes: Particle PSD at frequency quadrature nodes.
 
         Returns:
-            Complete spherical-harmonic templates and one eigenvalue per
-            returned angular mode.
+            Spherical-harmonic templates and one eigenvalue per returned
+            angular mode. When ``nonnegative_m_only`` is true, one complex
+            representative is returned for every conjugate ``+m/-m`` pair;
+            ``template_multiplicities`` records multiplicity two for ``m>0``.
         """
         eigenvalues = np.asarray(eigenvalues)
         eigenfunctions = np.asarray(eigenfunctions)
@@ -585,19 +643,6 @@ class KLTParticleDetector3D:
                 dtype=np.complex128,
             )
 
-        maximum_order = int(angular_orders.max()) + 1
-        uniform_bases = np.asarray(
-            [radial_basis(uniform_grid, order) for order in range(maximum_order)]
-        )[angular_orders]
-        quadrature_bases = np.asarray(
-            [radial_basis(quadrature_grid, order) for order in range(maximum_order)]
-        )[angular_orders]
-
-        parity_sign = np.where(
-            angular_orders % 2,
-            -1,
-            1,
-        )
         frequency_weights = (
             INVERSE_FOURIER_NORMALIZATION_3D
             * bandlimit
@@ -607,22 +652,32 @@ class KLTParticleDetector3D:
             * frequency_nodes**2
         )
         spatial_weights = support_radius / 2 * legendre_weights * spatial_nodes**2
-        right_basis = parity_sign[:, None, None] * quadrature_bases
-        interpolation_operator = (
-            uniform_bases * frequency_weights[None, None, :]
-        ) @ right_basis
-        uniform_eigenfunctions = (
-            np.einsum(
-                "bik,k,bk->bi",
-                interpolation_operator,
-                spatial_weights,
-                eigenfunctions,
-                optimize=True,
-            )
-            / eigenvalues[:, None]
+        uniform_eigenfunctions = np.empty(
+            (eigenvalues.size, uniform_radii.size),
+            dtype=np.complex128,
         )
+        for order in np.unique(angular_orders):
+            radial_indices = np.flatnonzero(angular_orders == order)
+            left_basis = radial_basis(uniform_grid, int(order))
+            left_basis *= frequency_weights[None, :]
+            right_basis = radial_basis(quadrature_grid, int(order))
+            if order % 2:
+                right_basis *= -1
+            weighted_eigenfunctions = (
+                spatial_weights[:, None] * eigenfunctions[radial_indices].T
+            )
+            projected_eigenfunctions = right_basis @ weighted_eigenfunctions
+            uniform_eigenfunctions[radial_indices] = (
+                left_basis @ projected_eigenfunctions
+            ).T / eigenvalues[radial_indices, None]
 
-        template_count = int(np.sum(2 * angular_orders + 1))
+        template_count = int(
+            np.sum(
+                angular_orders + 1
+                if nonnegative_m_only
+                else 2 * angular_orders + 1
+            )
+        )
         templates = np.empty(
             (template_count, *radius_tensor.shape),
             dtype=np.complex64,
@@ -630,53 +685,93 @@ class KLTParticleDetector3D:
         template_eigenvalues = np.empty(template_count, dtype=np.float64)
         template_orders = np.empty(template_count, dtype=np.int64)
         template_m_values = np.empty(template_count, dtype=np.int64)
+        template_multiplicities = np.empty(template_count, dtype=np.float32)
 
-        angular_cache: dict[int, npt.NDArray[np.complex64]] = {}
-        output_start = 0
-        for radial_index, angular_order in enumerate(angular_orders):
-            order = int(angular_order)
-            if order not in angular_cache:
-                angular_modes, _, _ = (
-                    expand_spherical_harmonic_templates(
-                        np.ones((1, *radius_tensor.shape), dtype=np.float32),
-                        np.asarray([order]),
-                        grid_x,
-                        grid_y,
-                        grid_z,
-                    )
-                )
-                angular_cache[order] = np.asarray(
-                    angular_modes,
-                    dtype=np.complex64,
-                )
-            angular_modes = angular_cache[order]
-            multiplicity = angular_modes.shape[0]
-            output_stop = output_start + multiplicity
-            radial_template = np.zeros(radius_tensor.shape, dtype=np.complex64)
-            radial_template[support_mask] = np.asarray(
-                uniform_eigenfunctions[
-                    radial_index,
-                    inverse_radius_indices,
-                ],
+        radial_multiplicities = (
+            angular_orders + 1
+            if nonnegative_m_only
+            else 2 * angular_orders + 1
+        )
+        radial_output_starts = np.concatenate(
+            (
+                np.zeros(1, dtype=np.int64),
+                np.cumsum(radial_multiplicities[:-1], dtype=np.int64),
+            )
+        )
+        flat_support_indices = np.flatnonzero(support_mask)
+        support_x = grid_x.ravel()[flat_support_indices]
+        support_y = grid_y.ravel()[flat_support_indices]
+        support_z = grid_z.ravel()[flat_support_indices]
+
+        # Radial modes are globally eigenvalue-sorted, so equal angular orders
+        # are generally interleaved. Process them by order and write each mode
+        # to its precomputed output slice. This reuses Y_ell^m within an order
+        # without retaining an angular grid for every ell in a large cache.
+        for order in tqdm(
+            np.unique(angular_orders),
+            desc="3-D KLT template construction",
+            unit="ell",
+        ):
+            order = int(order)
+            if nonnegative_m_only:
+                m_values = np.arange(0, order + 1, dtype=np.int64)
+            else:
+                m_values = np.arange(-order, order + 1, dtype=np.int64)
+            mode_orders = np.full(m_values.shape, order, dtype=np.int64)
+            angular_support = np.asarray(
+                evaluate_spherical_harmonics(
+                    mode_orders,
+                    m_values,
+                    support_x,
+                    support_y,
+                    support_z,
+                ),
                 dtype=np.complex64,
             )
-            templates[output_start:output_stop] = (
-                angular_modes * radial_template[None, ...]
+            multiplicity = m_values.size
+            angular_modes = np.zeros(
+                (multiplicity, *radius_tensor.shape),
+                dtype=np.complex64,
             )
-            template_eigenvalues[output_start:output_stop] = eigenvalues[
-                radial_index
-            ]
-            template_orders[output_start:output_stop] = order
-            template_m_values[output_start:output_stop] = np.arange(
-                -order,
-                order + 1,
-                dtype=np.int64,
-            )
-            output_start = output_stop
+            angular_modes.reshape(multiplicity, -1)[
+                :, flat_support_indices
+            ] = angular_support
+            del angular_support
+            for radial_index in np.flatnonzero(angular_orders == order):
+                output_start = int(radial_output_starts[radial_index])
+                output_stop = output_start + multiplicity
+                radial_template = np.zeros(
+                    radius_tensor.shape,
+                    dtype=np.complex64,
+                )
+                radial_template[support_mask] = np.asarray(
+                    uniform_eigenfunctions[
+                        radial_index,
+                        inverse_radius_indices,
+                    ],
+                    dtype=np.complex64,
+                )
+                np.multiply(
+                    angular_modes,
+                    radial_template[None, ...],
+                    out=templates[output_start:output_stop],
+                )
+                template_eigenvalues[output_start:output_stop] = eigenvalues[
+                    radial_index
+                ]
+                template_orders[output_start:output_stop] = order
+                template_m_values[output_start:output_stop] = m_values
+                template_multiplicities[output_start:output_stop] = (
+                    np.where(m_values == 0, 1, 2)
+                    if nonnegative_m_only
+                    else np.ones(multiplicity)
+                )
+            del angular_modes
 
         self.eigvals = template_eigenvalues
         self.template_orders = template_orders
         self.template_m_values = template_m_values
+        self.template_multiplicities = template_multiplicities
         return templates, template_eigenvalues
 
     def create_GPSF_templates(  # noqa: N802
